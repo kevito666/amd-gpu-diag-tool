@@ -1,0 +1,5 @@
+amd-gpu-diagnostic
+*.o
+*.log
+*.csv
+*~
