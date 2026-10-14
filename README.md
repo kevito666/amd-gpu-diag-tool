@@ -1,241 +1,179 @@
 # AMD GPU Diagnostic Tool
 
-A low-overhead Linux AMDGPU power-policy watchdog, live hardware monitor and
-diagnostic correlator written in C.
+A lightweight X11/XLibre GUI for AMDGPU power-policy locking and diagnostics on Linux.
 
-It was built to investigate rapid AMD GPU power/clock-state transitions that can
-cause audible coil whine, unstable power behaviour, or other Linux-only GPU
-power-management problems while keeping the normal monitoring path lightweight.
+The application is written in C and uses plain Xlib for the interface. It intentionally avoids GTK, Qt, Electron, ncurses, libdrm, XCB as a direct dependency, and other GUI frameworks. The diagnostic core talks directly to Linux sysfs, procfs, debugfs, tracefs, and DRM fdinfo interfaces.
 
-> **Current release:** v0.4.1  
-> **Platform:** Linux + `amdgpu`  
-> **Default policy:** `profile_standard`  
-> **Privilege:** root required
+**Version:** 0.5.2  
+**License:** GPL-3.0-or-later
 
-## Highlights
+## Designed for
 
-- Actively verifies and re-applies the selected AMDGPU power policy.
-- Selectable power modes from the live terminal UI.
-- Adaptive watchdog: low-overhead steady monitoring with a temporary fast burst
-  after a real mismatch.
-- Per-process GPU attribution using DRM `/proc/<pid>/fdinfo` accounting.
-- Live temperature, fan, power, voltage, clocks, VRAM and utilization telemetry.
-- VRAM usage bar on the main dashboard.
-- GFXOFF monitoring and transition correlation.
-- X11, X11Libre and Wayland session detection.
-- Compositor detection including picom, KWin, Mutter, Xfwm4, gamescope and more.
-- DRM connector/KMS display summary.
-- In-memory event flight recorder and optional CSV logging.
-- Optional isolated tracefs monitoring for AMDGPU, DRM scheduler and display events.
-- Optional SCLK/MCLK DPM-state monitoring.
-- Built-in sysfs polling benchmark.
-- No GUI toolkit or ncurses dependency.
+This GUI build is intentionally X11/XLibre-first and is a particularly good fit for Arch Linux + XFCE. XLibre is detected from the running X server vendor string when available. The active X11 compositor is identified through the standard `_NET_WM_CM_S0` selection owner, which makes picom detection substantially more reliable than process-name guessing.
 
-## Dashboard
+Wayland is not a target of this GUI build.
 
-The normal screen is intentionally a summary. Detailed information lives on
-specialist pages.
+## Features
 
-```text
-AMD GPU Diagnostic Tool v0.4.1
-AMD Radeon RX 7900 XTX
-card1  PCI 0000:03:00.0  ID 1002:744c  VRAM 24.0 GiB
+- AMDGPU power-policy watchdog with `profile_standard` as the default target.
+- Adaptive correction: low-overhead steady polling with a short faster burst after an actual policy reset.
+- Prominent top-of-window power-mode selector with clickable modes and keyboard shortcuts.
+- A dominant full-width board-power bar plus always-visible bars for GPU load, VRAM, CPU load, system RAM, GPU voltage, and current.
+- Live temperature, fan RPM/percentage, board power, GFX clock, and memory clock.
+- Uses a real hwmon current sensor when available; otherwise shows an explicitly labelled 12 V board-current estimate from `board_power / 12 V`.
+- Per-process DRM activity attribution.
+- GFXOFF monitoring.
+- Power-profile, PCIe, KMS, connector, plane, and display diagnostics.
+- Exact X11 compositor-owner detection plus window-manager identification.
+- Diagnostic event flight recorder and optional CSV logging.
+- Optional isolated tracefs diagnostics.
+- Manual GFX/MEM DPM-level cycling.
+- Event-driven Xlib GUI with no animation/render loop.
 
-Hardware: Temp 51 C | Fan 843 RPM (32%) | Power 81 W | VDDGFX 0.781 V
-Clocks:   GFX 1427 MHz | MEM 1249 MHz | GPU 18% | MEM busy 7%
-VRAM  [########....................]  6.84 / 24.0 GiB  28.5%
+## Runtime footprint
 
-LOCK      profile_standard / locked
-POWER     GFXOFF + utilization summary
-CLIENTS   top GPU processes
-DESKTOP   X11Libre / picom / display summary
-EVENTS    latest correlated transition
-TRACE     trace state + latest kernel actor
+The GUI directly links only to:
+
+- `libX11`
+- `libc`
+
+The current optimized binary is roughly 80 KiB on the development build system. Runtime size varies slightly by compiler/toolchain.
+
+## Arch Linux requirements
+
+On XFCE/XLibre you will almost certainly already have `libx11` installed.
+
+```bash
+sudo pacman -S --needed base-devel libx11
 ```
 
-Values shown above are illustrative; the program displays the interfaces exposed
-by the installed kernel and GPU.
+No GTK or Qt packages are required.
 
 ## Build
 
-Requirements:
-
-- Linux
-- GCC or a compatible C compiler
-- Linux `amdgpu` driver
-- `make`
-
 ```bash
 make
-sudo ./amd-gpu-diagnostic
+make check
 ```
 
-Install system-wide:
+## Run
+
+AMDGPU power-policy controls normally require root. Preserve the X11 display/authentication environment when using sudo:
 
 ```bash
-sudo make install
-sudo amd-gpu-diagnostic
+sudo -E ./amd-gpu-diagnostic
 ```
 
-Uninstall:
+If your sudo configuration does not preserve X11 authentication:
 
 ```bash
-sudo make uninstall
+sudo env DISPLAY="$DISPLAY" XAUTHORITY="$XAUTHORITY" ./amd-gpu-diagnostic
 ```
+
+The application deliberately lowers its process priority by default so audio and game workloads receive scheduling preference.
+
+## Main GUI
+
+The top control/status block keeps power control and physical system state visible on every page:
+
+- full GPU name
+- DRM card / PCI address / PCI ID
+- total VRAM
+- requested vs actual AMDGPU policy and the eight power-mode buttons
+- temperature, fan RPM/percentage, and board power
+- GFX and memory clocks
+- GPU-load and VRAM-usage bars
+- CPU-load and system-RAM bars
+- measured GPU voltage bar
+- current bar: hardware current sensor when available, otherwise a labelled `P/12 V` board-current estimate
+
+The Home view summarizes one or two important facts from every detailed page rather than duplicating all diagnostic data.
 
 ## Power modes
 
-The mode keys are always shown at the bottom of the UI:
+The power-mode buttons are always visible near the top of the window, immediately below the target/actual power-policy status:
 
-```text
-[1] Auto  [2] Low  [3] High  [4] Standard
-[5] Min-GFX  [6] Min-MEM  [7] Peak  [8] Manual
-```
+- `1` Auto
+- `2` Low
+- `3` High
+- `4` Standard (`profile_standard`)
+- `5` Min-GFX
+- `6` Min-MEM
+- `7` Peak
+- `8` Manual
 
-Normal launch defaults to `profile_standard`:
+`profile_standard` is the default.
 
-```bash
-sudo ./amd-gpu-diagnostic
-```
+## Views and controls
 
-Override it explicitly:
+- `0` Home
+- `P` GPU clients
+- `G` Power / DPM
+- `W` X11 / desktop / display
+- `E` diagnostic events
+- `R` kernel trace
+- `H` help
+- `I` About
+- `Space` pause/resume watchdog
+- `A` adaptive correction burst
+- `C` DPM clock telemetry
+- `+` / `-` watchdog rate
+- `D` DPM telemetry rate
+- `S` cycle manual GFX DPM level
+- `M` cycle manual memory DPM level
+- `X` clear manual clock locks
+- `T` tracefs on/off
+- `L` CSV logging on/off
+- `Q` quit
 
-```bash
-sudo ./amd-gpu-diagnostic --mode high
-```
+The main tabs, power modes, watchdog, adaptive mode, DPM telemetry, trace, and CSV log toggles are clickable.
 
-Supported policies:
+## Sampling design
 
-- `auto`
-- `low`
-- `high`
-- `profile_standard`
-- `profile_min_sclk`
-- `profile_min_mclk`
-- `profile_peak`
-- `manual`
+The program deliberately separates inexpensive enforcement from expensive telemetry:
 
-## Views and hotkeys
+- Power-policy watchdog: 5 ms / 200 Hz by default.
+- Adaptive correction burst: 500 us / 2 kHz for 250 ms after a real mismatch.
+- Basic GPU hardware telemetry: 10 Hz.
+- CPU/RAM telemetry: 2 Hz.
+- Per-process DRM accounting: 2 Hz.
+- Desktop/display discovery: 0.2 Hz.
+- Expensive `pp_dpm_*` sampling: off by default.
+- Kernel tracing: off by default.
+- GUI redraw: at most 4 Hz and only when dirty.
 
-| Key | Action |
-|---|---|
-| `0` | Dashboard |
-| `P` | Per-process DRM GPU clients |
-| `G` | Power / clocks / DPM / GFXOFF / PCIe |
-| `W` | Desktop / compositor / connectors / KMS |
-| `E` | Event flight recorder |
-| `R` | Kernel trace status |
-| `H` | Help |
-| `1..8` | Select power mode |
-| `S` / `M` | Select manual SCLK/MCLK DPM level |
-| `X` | Clear manual clock locks |
-| `Space` | Pause/resume enforcement |
-| `+` / `-` | Adjust steady watchdog interval |
-| `A` | Toggle adaptive correction burst |
-| `C` | Toggle expensive DPM SCLK/MCLK telemetry |
-| `D` | Cycle DPM telemetry rate |
-| `B` | Policy-only sysfs benchmark |
-| `L` | Toggle CSV event logging |
-| `T` | Toggle isolated kernel trace |
-| `Q` | Quit |
+This design exists partly because very aggressive amdgpu sysfs polling can cause scheduling latency and audio xruns even when average CPU utilization appears modest.
 
-## Monitoring architecture
+## XLibre / picom diagnostics
 
-The program deliberately separates fast enforcement from slower diagnostic
-sampling:
+The Desktop page uses Xlib to query the live server directly:
 
-| Monitor | Default |
-|---|---:|
-| Policy watchdog | 5 ms / 200 Hz |
-| Adaptive correction burst | 500 us / 2 kHz for 250 ms |
-| Basic hardware telemetry | 10 Hz |
-| Power profile / PCIe / gpu_metrics | ~1 Hz |
-| Per-process DRM clients | 2 Hz |
-| Desktop / KMS discovery | 0.2 Hz |
-| `pp_dpm_sclk` / `pp_dpm_mclk` | Off by default; optional 4 Hz |
-| Kernel tracefs | Off by default |
+- `ServerVendor()` identifies XLibre when the running server reports it.
+- `_NET_WM_CM_S0` identifies the active compositor selection owner.
+- `_NET_WM_PID` maps that owner back to its process (for example picom).
+- `_NET_SUPPORTING_WM_CHECK` identifies the window manager (for example Xfwm4).
 
-The process also defaults to `nice +10` so latency-sensitive applications such
-as PipeWire get scheduling preference.
+Process scanning remains as a fallback for diagnostic context.
 
-## Why DPM-state polling is optional
+## Security
 
-On the RX 7900 XTX development system, reading `pp_dpm_sclk` and `pp_dpm_mclk`
-continuously was substantially more expensive than reading the power-policy
-attribute. Very aggressive polling could also disturb latency-sensitive audio.
+This program writes privileged AMDGPU sysfs controls and currently runs the GUI process as root. X11 is not a privilege-separated display protocol, so this version is intended for a trusted, local, single-user desktop session. Do not expose the X server to untrusted clients.
 
-For that reason, the normal watchdog reads only the inexpensive policy interface.
-Detailed DPM-state telemetry is opt-in.
-
-## Per-process GPU attribution
-
-The Clients page scans standardized DRM accounting records in
-`/proc/<pid>/fdinfo` for the selected GPU and calculates activity deltas for
-available engines such as:
-
-- GFX
-- compute
-- DMA / SDMA / copy
-- media / video
-- VRAM residency or allocation
-
-This makes it possible to correlate a clock or power event with processes such
-as a game, browser GPU process, Telegram, picom, KWin, Xorg/Xwayland, gamescope
-or Steam.
-
-## Event flight recorder
-
-The latest diagnostic events are kept in RAM. Events can include:
-
-- policy reset / correction
-- GFXOFF transition
-- large sampled power step
-- optional SCLK/MCLK DPM-state change
-
-Each event records the current top DRM client and, when trace mode is enabled,
-the latest kernel trace actor.
-
-Press `L` to log events to:
-
-```text
-/tmp/amd-gpu-diagnostic-events-<pid>.csv
-```
-
-## Kernel trace mode
-
-Press `T` to create an isolated tracefs instance and enable available AMDGPU,
-DRM scheduler and selected DRM display tracepoints. The global tracing buffer is
-not used.
-
-Tracing is deliberately off by default because a busy 3D workload can generate
-a large number of events.
-
-## Safety notes
-
-This program writes AMDGPU power-management sysfs controls and therefore must be
-run as root. Unsupported controls are not guaranteed to exist on every AMD GPU
-or kernel version.
-
-Aggressive polling is intentionally limited. Use `--unsafe-fast` only when you
-are deliberately testing the system and understand that extremely high sysfs
-poll rates can increase kernel latency.
-
-## Project status
-
-This is an early diagnostic tool developed and tested primarily around an AMD
-Radeon RX 7900 XTX on Linux. Hardware and kernel interfaces vary, so reports from
-other AMDGPU generations are useful.
-
-Bug reports should include:
-
-- GPU model
-- kernel version
-- Mesa version
-- X11/X11Libre/Wayland session
-- desktop/compositor
-- relevant terminal output
-- whether DPM telemetry or trace mode was enabled
+A future split privileged helper / unprivileged GUI is possible, but it would add IPC and lifecycle complexity. This release favors the smallest practical implementation for a trusted workstation.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+GNU General Public License version 3 or later (`GPL-3.0-or-later`). See `LICENSE`.
+
+
+## About
+
+**Developer:** Kevin  
+**Copyright:** © 2026 Kevin Kolasa  
+**Developed in:** Akita City, Akita Prefecture, Japan
+
+AMD GPU Diagnostic Tool grew from the practical need to understand Linux AMDGPU power-state switching, desktop/game rendering interactions, and associated coil-whine behavior.
+
+The project prioritizes low overhead, simple native C, transparent Linux kernel interfaces, and minimal dependencies. Project direction, hardware testing, and technical decisions remain under direct developer review. AI-assisted development tools are used to accelerate implementation, testing, review, and documentation.
+
+**License:** GPL-3.0-or-later

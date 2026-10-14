@@ -1,30 +1,31 @@
 # Architecture
 
-AMD GPU Diagnostic Tool separates enforcement from diagnostics so expensive
-telemetry cannot sit in the latency-sensitive watchdog path.
+AMD GPU Diagnostic Tool v0.5.2 is a single-process C application with two intentionally separate responsibilities:
 
-## Sampling tiers
+1. A low-overhead AMDGPU diagnostic/watchdog core using Linux kernel interfaces directly.
+2. A minimal event-driven Xlib frontend for X11/XLibre.
 
-| Tier | Default rate | Purpose |
-|---|---:|---|
-| Policy watchdog | 200 Hz | Verify and repair `power_dpm_force_performance_level` |
-| Adaptive burst | 2 kHz for 250 ms | Rapid follow-up after a real policy mismatch |
-| Basic hardware telemetry | 10 Hz | Busy, power, temperature, clocks, fan, voltage, GFXOFF |
-| Slow driver telemetry | ~1 Hz | Power profile, PCIe accounting, gpu_metrics header |
-| DRM client attribution | 2 Hz | Per-process GPU activity from `/proc/<pid>/fdinfo` |
-| Desktop/KMS discovery | 0.2 Hz | Session, compositor, connectors and display state |
-| DPM state telemetry | Off / 4 Hz | Optional `pp_dpm_sclk` and `pp_dpm_mclk` reads |
-| Kernel tracing | Off | Opt-in tracefs event correlation |
+## Dependency rule
 
-## Event correlation
+The project avoids external libraries unless they materially improve correctness or provide functionality that is unreasonable to implement directly.
 
-A circular in-memory flight recorder records policy resets, corrections, power
-steps, GFXOFF transitions and optional DPM-state changes. Each event snapshots
-the highest-activity DRM client and the latest kernel trace actor when tracing
-is enabled.
+The GUI adds only Xlib. The diagnostic core continues to use libc plus kernel virtual filesystems/interfaces.
 
-## Root requirement
+## Timing tiers
 
-The UI and diagnostics can read many kernel interfaces without root, but the
-program currently requires root because it also writes AMDGPU power-policy
-sysfs attributes and manages isolated tracefs instances.
+The 5 ms watchdog touches only the cheap power-policy attribute during stable operation. Expensive DPM reads, process accounting, desktop discovery, and tracing run independently at much lower rates or only when explicitly enabled.
+
+System CPU/RAM sampling uses `/proc/stat` and `/proc/meminfo` at 2 Hz and does not add a library dependency.
+
+The Xlib UI has no animation loop. X events are processed from the same main loop and the window is repainted only when data changed, with a maximum redraw rate of 4 Hz.
+
+## X11 introspection
+
+The GUI uses standard X11/EWMH mechanisms instead of shelling out to tools:
+
+- X server vendor: `ServerVendor()`
+- compositor: `_NET_WM_CM_S0`
+- compositor PID: `_NET_WM_PID`
+- window manager: `_NET_SUPPORTING_WM_CHECK` and `_NET_WM_NAME`
+
+This is both lighter and more authoritative than launching `xprop`, `wmctrl`, or process-grep helpers.

@@ -1,5 +1,7 @@
 amd-gpu-diagnostic
+.check-amd-gpu-diagnostic
 *.o
 *.log
 *.csv
-*~
+
+*.bak
