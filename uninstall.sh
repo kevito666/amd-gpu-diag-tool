@@ -9,4 +9,4 @@ if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "$HOME/.local/share/applications" >/dev/null 2>&1 || true
 fi
 
-printf 'AMD GPU Diagnostic Tool removed.\n'
+printf 'AMD GPU Performance and Diagnostic Tool removed.\n'

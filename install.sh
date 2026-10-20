@@ -16,7 +16,7 @@ command -v pacman >/dev/null 2>&1 || die "This installer currently supports Arch
 info "Installing minimal dependencies"
 sudo pacman -S --needed base-devel libx11
 
-info "Building and checking AMD GPU Diagnostic Tool"
+info "Building and checking AMD GPU Performance and Diagnostic Tool"
 cd "$SRC_DIR"
 make clean
 make check
@@ -52,7 +52,7 @@ mkdir -p "$(dirname "$DESKTOP")"
 cat > "$DESKTOP" <<EOF
 [Desktop Entry]
 Type=Application
-Name=AMD GPU Diagnostic Tool
+Name=AMD GPU Performance and Diagnostic Tool
 Comment=AMDGPU diagnostics, telemetry, and power-policy watchdog
 Exec=$WRAPPER
 Terminal=false

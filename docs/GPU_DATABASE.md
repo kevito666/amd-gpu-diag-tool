@@ -1,6 +1,6 @@
 # GPU Reference Database
 
-AMD GPU Diagnostic Tool v0.6.0 contains a small compiled-in database of AMD **desktop reference-card** specifications. It is used for identification, context, reference clocks/TBP, and color-zone baselines. It is **not** used to override the running kernel/firmware tuning limits.
+AMD GPU Performance and Diagnostic Tool v0.6.0 contains a small compiled-in database of AMD **desktop reference-card** specifications. It is used for identification, context, reference clocks/TBP, and color-zone baselines. It is **not** used to override the running kernel/firmware tuning limits.
 
 ## Runtime authority
 

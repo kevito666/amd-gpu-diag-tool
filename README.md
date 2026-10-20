@@ -1,6 +1,6 @@
-# AMD GPU Diagnostic Tool
+# AMD GPU Performance and Diagnostic Tool
 
-A lightweight X11/XLibre GUI for AMDGPU power-policy locking and diagnostics on Linux.
+A lightweight X11/XLibre GUI for AMDGPU power-policy locking, performance monitoring, and diagnostics on Linux.
 
 The application is written in C and uses plain Xlib for the interface. It intentionally avoids GTK, Qt, Electron, ncurses, libdrm, XCB as a direct dependency, and other GUI frameworks. The diagnostic core talks directly to Linux sysfs, procfs, debugfs, tracefs, and DRM fdinfo interfaces.
 
@@ -198,7 +198,7 @@ GNU General Public License version 3 or later (`GPL-3.0-or-later`). See `LICENSE
 **Copyright:** © 2026 Kevin Kolasa  
 **Developed in:** Akita City, Akita Prefecture, Japan
 
-AMD GPU Diagnostic Tool grew from the practical need to understand Linux AMDGPU power-state switching, desktop/game rendering interactions, and associated coil-whine behavior.
+AMD GPU Performance and Diagnostic Tool grew from the practical need to understand Linux AMDGPU power-state switching, desktop/game rendering interactions, and associated coil-whine behavior.
 
 The project prioritizes low overhead, simple native C, transparent Linux kernel interfaces, and minimal dependencies. Project direction, hardware testing, and technical decisions remain under direct developer review. AI-assisted development tools are used to accelerate implementation, testing, review, and documentation.
 

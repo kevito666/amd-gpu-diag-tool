@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.1
+
+- Renamed to "AMD GPU Performance and Diagnostic Tool" across UI, docs, and install scripts.
+- Added version string to the window title bar.
+- Increased bar-graph font size for improved readability.
+- Added high-contrast text colors on light green and yellow bar segments.
+- Extended power bar range to 800W to accommodate heavy AI/ML workloads.
+- Added manual fan speed control (PWM percentage) to the Tuning page.
+- Added shader and memory clock max values to dashboard POWER/CLOCKS panel.
+
 ## 0.6.0
 
 - Added guarded software tuning for firmware-exposed GFX clock/min-max or RDNA4 SCLK offset, memory max clock, VDDGFX offset, and board power cap.

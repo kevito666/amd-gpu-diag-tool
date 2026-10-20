@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 Kevin Kolasa
  *
- * AMD GPU Diagnostic Tool
+ * AMD GPU Performance and Diagnostic Tool
  * Lightweight X11/XLibre AMDGPU diagnostics and power-policy control.
  */
 
@@ -55,7 +55,7 @@
 #define NOMINAL_BOARD_VOLTAGE 12.0
 #define VOLTAGE_BAR_MAX_V 1.20
 #define CURRENT_BAR_MAX_A 50.0
-#define POWER_BAR_MAX_W 600.0
+#define POWER_BAR_MAX_W 800.0
 #define MAX_GPU_CLIENTS 128
 #define MAX_DIAG_EVENTS 96
 #define MAX_TRACE_LINE 512
@@ -98,6 +98,7 @@ typedef struct {
     int fd_freq2;
     int fd_fan_rpm;
     int fd_pwm;
+    int fd_pwm_w;
     int fd_pwm_max;
     int fd_voltage;
     int fd_current;
@@ -255,6 +256,8 @@ typedef struct {
     double fan_pct;
     long long gfx_hz;
     long long mem_hz;
+    long long gfx_hz_max;
+    long long mem_hz_max;
     char freq1_label[32];
     char freq2_label[32];
     unsigned long long vram_used;
@@ -338,6 +341,12 @@ typedef struct {
     long edit_mclk_max_mhz;
     long edit_vdd_offset_mv;
     double edit_power_cap_w;
+
+    bool has_fan;
+    int fan_rpm;
+    long fan_pwm;
+    long fan_pwm_max;
+    long edit_fan_pwm;
 
     bool initialized;
     const GpuSpec *spec;
@@ -640,7 +649,7 @@ static int choose_gpu(Gpu *gpus, int count, int requested_card) {
 static void sysfs_close(Sysfs *s) {
     int *fds[] = {&s->fd_policy_r,&s->fd_policy_w,&s->fd_sclk_r,&s->fd_sclk_w,
                   &s->fd_mclk_r,&s->fd_mclk_w,&s->fd_busy,&s->fd_mem_busy,&s->fd_power,
-                  &s->fd_freq1,&s->fd_freq2,&s->fd_fan_rpm,&s->fd_pwm,&s->fd_pwm_max,&s->fd_voltage,&s->fd_current,
+                  &s->fd_freq1,&s->fd_freq2,&s->fd_fan_rpm,&s->fd_pwm,&s->fd_pwm_w,&s->fd_pwm_max,&s->fd_voltage,&s->fd_current,
                   &s->fd_vram_used,&s->fd_power_profile,&s->fd_pcie_bw,
                   &s->fd_power_cap_r,&s->fd_power_cap_w,&s->fd_power_cap_min,&s->fd_power_cap_max,
                   &s->fd_od_r,&s->fd_od_w};
@@ -742,6 +751,7 @@ static void find_hwmon(const Gpu *g, Sysfs *s) {
         if (path_join(p, sizeof(p), base, "pwm1") && path_exists(p)) {
             text_copy(s->pwm_path, sizeof(s->pwm_path), p);
             s->fd_pwm = open(p, O_RDONLY | O_CLOEXEC);
+            s->fd_pwm_w = open(p, O_WRONLY | O_CLOEXEC);
         }
         if (path_join(p, sizeof(p), base, "pwm1_max") && path_exists(p)) {
             text_copy(s->pwm_max_path, sizeof(s->pwm_max_path), p);
@@ -845,7 +855,7 @@ static int sysfs_open(const Gpu *g, Sysfs *s) {
     s->fd_policy_r = s->fd_policy_w = s->fd_sclk_r = s->fd_sclk_w = -1;
     s->fd_mclk_r = s->fd_mclk_w = s->fd_busy = s->fd_mem_busy = -1;
     s->fd_power = s->fd_freq1 = s->fd_freq2 = -1;
-    s->fd_fan_rpm = s->fd_pwm = s->fd_pwm_max = s->fd_voltage = s->fd_current = -1;
+    s->fd_fan_rpm = s->fd_pwm = s->fd_pwm_w = s->fd_pwm_max = s->fd_voltage = s->fd_current = -1;
     s->fd_vram_used = s->fd_power_profile = s->fd_pcie_bw = -1;
     s->fd_power_cap_r = s->fd_power_cap_w = s->fd_power_cap_min = s->fd_power_cap_max = -1;
     s->fd_od_r = s->fd_od_w = -1;
@@ -1163,6 +1173,25 @@ static long read_long_fd(int fd, long fallback) {
     return value;
 }
 
+/* Parse max MHz from pp_dpm_sclk / pp_dpm_mclk files.
+   Format: "s:  700Mhz *900Mhz 1100Mhz 1300Mhz" — highest number wins. */
+static long parse_dpm_max_mhz(const char *path) {
+    char buf[512];
+    if (read_path_text(path, buf, sizeof(buf)) < 0) return -1;
+    long max_mhz = -1;
+    char *tok = strtok(buf, " \t\n");
+    while (tok) {
+        /* Skip tokens without digits (e.g. "s:", "*") */
+        char *end = NULL;
+        long val = strtol(tok, &end, 10);
+        if (end != tok && *end == 0) {
+            if (max_mhz < 0 || val > max_mhz) max_mhz = val;
+        }
+        tok = strtok(NULL, " \t\n");
+    }
+    return max_mhz;
+}
+
 static void sample_power(Sysfs *s, PowerTelemetry *p) {
     p->gpu_busy = (int)read_long_fd(s->fd_busy, -1);
     p->mem_busy = (int)read_long_fd(s->fd_mem_busy, -1);
@@ -1237,6 +1266,10 @@ static void sample_power(Sysfs *s, PowerTelemetry *p) {
                 close(fd);
             }
         }
+
+        /* Max clocks change only on DPM reconfiguration; sample slowly. */
+        p->gfx_hz_max = parse_dpm_max_mhz(s->sclk_path);
+        p->mem_hz_max = parse_dpm_max_mhz(s->mclk_path);
     }
 
     uint32_t v;
@@ -1514,8 +1547,14 @@ static void tuning_refresh(Sysfs *s, TuningState *t, bool capture_defaults) {
         t->power_cap_max_w = pmax >= 0 ? pmax / 1000000.0 : t->power_cap_w;
     }
 
+    t->fan_rpm = (int)read_long_fd(s->fd_fan_rpm, -1);
+    t->fan_pwm = read_long_fd(s->fd_pwm, -1);
+    t->fan_pwm_max = read_long_fd(s->fd_pwm_max, -1);
+    if (t->fan_pwm_max <= 0) t->fan_pwm_max = 255;
+    t->has_fan = t->fan_pwm >= 0;
+
     t->available = t->has_sclk || t->has_sclk_offset || t->has_mclk ||
-                   t->has_vdd_offset || t->has_power_cap;
+                   t->has_vdd_offset || t->has_power_cap || t->has_fan;
 
     if (!was_initialized || capture_defaults) {
         t->default_sclk_min_mhz = t->sclk_min_mhz;
@@ -1532,6 +1571,7 @@ static void tuning_refresh(Sysfs *s, TuningState *t, bool capture_defaults) {
         t->edit_mclk_max_mhz = t->mclk_max_mhz;
         t->edit_vdd_offset_mv = t->vdd_offset_mv;
         t->edit_power_cap_w = t->power_cap_w;
+        t->edit_fan_pwm = t->fan_pwm;
     } else {
         t->default_sclk_min_mhz = old_def_smin;
         t->default_sclk_max_mhz = old_def_smax;
@@ -1547,6 +1587,7 @@ static void tuning_refresh(Sysfs *s, TuningState *t, bool capture_defaults) {
         t->edit_mclk_max_mhz = t->mclk_max_mhz;
         t->edit_vdd_offset_mv = t->vdd_offset_mv;
         t->edit_power_cap_w = t->power_cap_w;
+        t->edit_fan_pwm = t->fan_pwm;
     }
     t->initialized = true;
 }
@@ -1660,6 +1701,18 @@ static int tuning_apply(Sysfs *s, Target *target, TuningState *t,
         }
     }
 
+    if (t->has_fan && s->fd_pwm_w >= 0) {
+        t->edit_fan_pwm = clamp_long_value(t->edit_fan_pwm, 0, t->fan_pwm_max);
+        char pwm_buf[32];
+        snprintf(pwm_buf, sizeof(pwm_buf), "%ld", t->edit_fan_pwm);
+        if (write_fd_text(s->fd_pwm_w, pwm_buf) < 0) {
+            snprintf(message, cap, "Clock settings applied, but fan PWM write failed: %s", strerror(errno));
+            t->armed = false;
+            tuning_refresh(s, t, false);
+            return -1;
+        }
+    }
+
     t->armed = false;
     tuning_refresh(s, t, false);
     snprintf(message, cap, "Tuning applied within driver/firmware limits. Writes disarmed.");
@@ -1723,6 +1776,10 @@ static void tuning_adjust(TuningState *t, int row, int direction) {
             if (t->has_power_cap)
                 t->edit_power_cap_w = clamp_double_value(t->edit_power_cap_w + direction * 5.0,
                                                           t->power_cap_min_w, t->power_cap_max_w);
+            break;
+        case 4:
+            if (t->has_fan)
+                t->edit_fan_pwm = clamp_long_value(t->edit_fan_pwm + sign * 10L, 0, t->fan_pwm_max);
             break;
         default:
             break;
@@ -2356,6 +2413,7 @@ typedef struct {
     unsigned long good;
     unsigned long warn;
     unsigned long bad;
+    unsigned long text_dark;
     bool dirty;
 } Gui;
 
@@ -2420,6 +2478,18 @@ static void gui_bar_color(Gui *ui, Rect r, double pct, const char *label,
     gui_fill(ui, fill, fill_color);
     gui_outline(ui, r, ui->dim);
     if (label && *label) gui_text(ui, r.x + 6, r.y + r.h - 6, ui->fg, true, "%s", label);
+}
+
+static void gui_bar_color_text(Gui *ui, Rect r, double pct, const char *label,
+                               unsigned long fill_color, unsigned long text_color) {
+    if (pct < 0.0) pct = 0.0;
+    if (pct > 100.0) pct = 100.0;
+    gui_fill(ui, r, ui->panel_alt);
+    Rect fill = r;
+    fill.w = (int)((double)r.w * pct / 100.0);
+    gui_fill(ui, fill, fill_color);
+    gui_outline(ui, r, ui->dim);
+    if (label && *label) gui_text(ui, r.x + 6, r.y + r.h - 6, text_color, true, "%s", label);
 }
 
 static unsigned long tune_zone_color(Gui *ui, TuneZone zone) {
@@ -2565,10 +2635,13 @@ static int gui_init(Gui *ui, SessionInfo *si) {
     ui->good = gui_color(ui, "#68d391", ui->fg);
     ui->warn = gui_color(ui, "#f6c85f", ui->fg);
     ui->bad = gui_color(ui, "#ff6b6b", ui->fg);
+    ui->text_dark = gui_color(ui, "#1a1d21", ui->bg);
 
     ui->win = XCreateSimpleWindow(ui->dpy, ui->root, 80, 80, (unsigned)ui->width, (unsigned)ui->height,
                                   0, ui->dim, ui->bg);
-    XStoreName(ui->dpy, ui->win, "AMD GPU Diagnostic Tool - XLibre");
+    char title[128];
+    snprintf(title, sizeof(title), "AMD GPU Performance and Diagnostic Tool v%s", VERSION);
+    XStoreName(ui->dpy, ui->win, title);
     XSelectInput(ui->dpy, ui->win, ExposureMask | KeyPressMask | ButtonPressMask | StructureNotifyMask);
     ui->wm_delete = XInternAtom(ui->dpy, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(ui->dpy, ui->win, &ui->wm_delete, 1);
@@ -2579,9 +2652,11 @@ static int gui_init(Gui *ui, SessionInfo *si) {
     XSetWMNormalHints(ui->dpy, ui->win, &hints);
 
     ui->gc = XCreateGC(ui->dpy, ui->win, 0, NULL);
-    ui->font = XLoadQueryFont(ui->dpy, "9x15");
+    ui->font = XLoadQueryFont(ui->dpy, "10x20");
+    if (!ui->font) ui->font = XLoadQueryFont(ui->dpy, "9x15");
     if (!ui->font) ui->font = XLoadQueryFont(ui->dpy, "fixed");
-    ui->font_bold = XLoadQueryFont(ui->dpy, "9x15bold");
+    ui->font_bold = XLoadQueryFont(ui->dpy, "10x20bold");
+    if (!ui->font_bold) ui->font_bold = XLoadQueryFont(ui->dpy, "9x15bold");
     if (!ui->font_bold) ui->font_bold = ui->font;
     gui_set_font(ui, false);
     XMapWindow(ui->dpy, ui->win);
@@ -2681,8 +2756,12 @@ static void draw_header(Gui *ui, const Gpu *g, Sysfs *s, const Target *t,
         snprintf(label, sizeof(label), "BOARD POWER   %.1f W    scale %.0f W", p->power_w, power_scale);
     else
         snprintf(label, sizeof(label), "BOARD POWER   unavailable");
-    gui_bar_color(ui, power_bar, power_pct, label,
-                  power_pct >= 95.0 ? ui->bad : power_pct >= 80.0 ? ui->warn : ui->accent);
+    if (power_pct >= 95.0)
+        gui_bar_color(ui, power_bar, power_pct, label, ui->bad);
+    else if (power_pct >= 80.0)
+        gui_bar_color_text(ui, power_bar, power_pct, label, ui->warn, ui->text_dark);
+    else
+        gui_bar_color(ui, power_bar, power_pct, label, ui->accent);
 
     /* Temperatures are deliberately prominent and always visible. */
     double temp_values[MAX_GPU_TEMPS + 1];
@@ -2715,8 +2794,12 @@ static void draw_header(Gui *ui, const Gpu *g, Sysfs *s, const Target *t,
             if (max_c < 80.0) max_c = 110.0;
             snprintf(label, sizeof(label), "%s   %.1f C", temp_names[i], temp_values[i]);
             TuneZone z = temperature_zone(temp_values[i], temp_crit[i], temp_emergency[i]);
-            gui_bar_color(ui, (Rect){margin + i * (tw + gap), 170, tw, 31},
-                          temp_values[i] * 100.0 / max_c, label, tune_zone_color(ui, z));
+            Rect temp_bar = {margin + i * (tw + gap), 170, tw, 31};
+            unsigned long fill = tune_zone_color(ui, z);
+            if (z == TUNE_ZONE_SAFE || z == TUNE_ZONE_WARNING)
+                gui_bar_color_text(ui, temp_bar, temp_values[i] * 100.0 / max_c, label, fill, ui->text_dark);
+            else
+                gui_bar_color(ui, temp_bar, temp_values[i] * 100.0 / max_c, label, fill);
         }
     } else {
         gui_bar_color(ui, (Rect){margin, 170, ui->width - margin * 2, 31}, 0.0,
@@ -2798,7 +2881,14 @@ static void draw_dashboard(Gui *ui, const Target *t, const Stats *st, int interv
 
     panel_title(ui, r[1], "POWER / CLOCKS");
     gui_text(ui,r[1].x+10,r[1].y+45,ui->fg,false,"GPU %d%%  MEM %d%%  %.1f W  %.1f C",p->gpu_busy,p->mem_busy,p->power_w,p->temp_c);
-    gui_text(ui,r[1].x+10,r[1].y+68,ui->dim,false,"GFXOFF %s  DPM monitor %s",gfxoff_text(p->gfxoff_status),monitor_clocks?"on":"off");
+    if (p->gfx_hz >= 0 && p->gfx_hz_max > 0 && p->mem_hz >= 0 && p->mem_hz_max > 0) {
+        gui_text(ui,r[1].x+10,r[1].y+68,ui->dim,false,
+                 "GFX %.0f/%.0f MHz  MEM %.0f/%.0f MHz",
+                 p->gfx_hz/1000000.0, p->gfx_hz_max,
+                 p->mem_hz/1000000.0, p->mem_hz_max);
+    } else {
+        gui_text(ui,r[1].x+10,r[1].y+68,ui->dim,false,"GFXOFF %s  DPM monitor %s",gfxoff_text(p->gfxoff_status),monitor_clocks?"on":"off");
+    }
 
     panel_title(ui, r[2], "GPU CLIENTS");
     const GpuClient *c = top_client(cm);
@@ -2967,6 +3057,17 @@ static void draw_tuning_page(Gui *ui, const TuningState *t) {
         draw_tuning_row(ui,3,"POWER CAP","unavailable","power1_cap is not exposed by this driver/board",TUNE_ZONE_UNAVAILABLE,false);
     }
 
+    if (t->has_fan) {
+        snprintf(value,sizeof(value),"%ld%% (%d RPM)",
+                 t->fan_pwm_max > 0 ? (t->edit_fan_pwm * 100 / t->fan_pwm_max) : 0,
+                 t->fan_rpm);
+        snprintf(range,sizeof(range),"PWM %ld..%ld | current %ld",
+                 (long)0,t->fan_pwm_max,t->fan_pwm);
+        draw_tuning_row(ui,4,"FAN SPEED",value,range,TUNE_ZONE_SAFE,true);
+    } else {
+        draw_tuning_row(ui,4,"FAN SPEED","unavailable","fan PWM not exposed by this driver/board",TUNE_ZONE_UNAVAILABLE,false);
+    }
+
     char arm[64];
     snprintf(arm,sizeof(arm),"ARM WRITES: %s",t->armed?"ARMED":"disarmed");
     draw_button(ui,tuning_action_rect(ui,0),arm,t->armed);
@@ -3039,7 +3140,7 @@ static void draw_help_page(Gui *ui) {
 static void draw_about_page(Gui *ui) {
     int x = 18, y = 385;
 
-    gui_text(ui, x, y, ui->accent, true, "AMD GPU Diagnostic Tool"); y += 32;
+    gui_text(ui, x, y, ui->accent, true, "AMD GPU Performance and Diagnostic Tool"); y += 32;
     gui_text(ui, x, y, ui->fg, true, "Version %s", VERSION); y += 26;
     gui_text(ui, x, y, ui->fg, false, "Developer: Kevin"); y += 24;
     gui_text(ui, x, y, ui->dim, false, "Copyright (C) 2026 Kevin Kolasa"); y += 34;
@@ -3190,7 +3291,7 @@ static int parse_int_arg(const char *s, int minv, int maxv, int *out) {
 }
 
 static void usage(const char *argv0) {
-    printf("AMD GPU Diagnostic Tool %s - X11/XLibre GUI\n",VERSION);
+    printf("AMD GPU Performance and Diagnostic Tool %s - X11/XLibre GUI\n",VERSION);
     printf("Usage: %s [--card N] [--interval-us N] [--dpm-interval-us N] [--mode MODE]\n",argv0);
     printf("          [--monitor-dpm] [--fixed] [--unsafe-fast] [--normal-priority] [--benchmark]\n");
     printf("Modes: auto low high manual profile_standard profile_min_sclk profile_min_mclk profile_peak\n");
@@ -3253,6 +3354,7 @@ static bool tuning_row_available(const TuningState *t, int row) {
         case 1: return t->has_mclk;
         case 2: return t->has_vdd_offset;
         case 3: return t->has_power_cap;
+        case 4: return t->has_fan;
         default: return false;
     }
 }
@@ -3276,7 +3378,7 @@ static void handle_click(Gui *ui, int x, int y, Sysfs *s, Target *target, Tuning
     }
 
     if (*view == VIEW_TUNING) {
-        for (int row=0; row<4; row++) {
+        for (int row=0; row<5; row++) {
             if (point_in(tuning_minus_rect(ui,row),x,y) || point_in(tuning_plus_rect(ui,row),x,y)) {
                 if (!tuning_row_available(tuning,row)) {
                     snprintf(message,message_cap,"That tuning control is not exposed by this ASIC/driver.");

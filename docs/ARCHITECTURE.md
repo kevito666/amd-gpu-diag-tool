@@ -1,6 +1,6 @@
 # Architecture
 
-AMD GPU Diagnostic Tool v0.6.0 is a single-process C application with two intentionally separate responsibilities:
+AMD GPU Performance and Diagnostic Tool v0.6.0 is a single-process C application with two intentionally separate responsibilities:
 
 1. A low-overhead AMDGPU diagnostic/watchdog core using Linux kernel interfaces directly.
 2. A minimal event-driven Xlib frontend for X11/XLibre.
