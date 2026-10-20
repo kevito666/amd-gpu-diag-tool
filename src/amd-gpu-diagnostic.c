@@ -19,11 +19,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/resource.h>
 #include <time.h>
 #include <unistd.h>
+#include <libgen.h>
 
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
@@ -31,9 +35,11 @@
 #include <X11/keysym.h>
 #include <sys/time.h>
 
+#include <curl/curl.h>
+
 #include "gpu_specs.h"
 
-#define VERSION "0.6.0"
+#define VERSION "0.6.1"
 #define MAX_PATH_LEN 512
 #define MAX_TEXT 4096
 #define MAX_LEVELS 32
@@ -274,6 +280,42 @@ typedef struct {
     unsigned slow_tick;
 } PowerTelemetry;
 
+typedef enum {
+    WORKFLOW_AI = 0,
+    WORKFLOW_GAMING
+} WorkflowMode;
+
+typedef struct {
+    pid_t pid;
+    char name[16];
+    double cpu_pct;
+} TopProcess;
+
+typedef enum {
+    TOKEN_SOURCE_HEURISTIC = 0,
+    TOKEN_SOURCE_LLAMA,
+    TOKEN_SOURCE_OLLAMA,
+    TOKEN_SOURCE_VLLM
+} TokenSource;
+
+typedef struct {
+    double tokens_per_sec;
+    double prompt_tokens_per_sec;
+    int64_t total_tokens;
+    int64_t prompt_tokens;
+    int64_t eval_tokens;
+    bool has_data;
+    char source_label[32];
+    /* Heuristic state */
+    double power_history[100];
+    int power_history_idx;
+    double recent_peak_w;
+    bool in_decode_phase;
+    double decode_power_w;
+    /* API state */
+    time_t last_api_poll;
+} TokenRate;
+
 typedef struct {
     double cpu_pct;
     unsigned cpu_threads;
@@ -289,6 +331,34 @@ typedef struct {
     double cpu_temp_c;
     long cpu_temp_crit_mc;
     bool cpu_temp_discovered;
+
+    /* CPU fan */
+    int fd_cpu_fan_rpm;
+    char cpu_fan_rpm_path[MAX_PATH_LEN];
+    int cpu_fan_rpm;
+    int fd_cpu_fan_pct;
+    char cpu_fan_pct_path[MAX_PATH_LEN];
+    double cpu_fan_pct;
+    bool cpu_fan_discovered;
+
+    /* Motherboard temperatures */
+    int mb_temp_count;
+    int mb_temp_fds[4];
+    char mb_temp_paths[4][MAX_PATH_LEN];
+    char mb_temp_labels[4][32];
+    double mb_temp_c[4];
+    bool mb_temp_discovered;
+
+    /* Top CPU processes */
+    TopProcess top_procs[3];
+    int top_proc_count;
+
+    /* Token rate estimation */
+    TokenRate tokens;
+    TokenSource token_source;
+    bool llama_available;
+    bool ollama_available;
+    bool vllm_available;
 } SystemTelemetry;
 
 typedef enum {
@@ -391,6 +461,8 @@ typedef struct {
 } TraceState;
 
 static volatile sig_atomic_t g_stop = 0;
+static WorkflowMode g_workflow = WORKFLOW_AI;
+static TokenSource g_token_source = TOKEN_SOURCE_HEURISTIC;
 
 static const char *POLICIES[] = {
     "auto",
@@ -477,6 +549,202 @@ static int read_path_text(const char *path, char *buf, size_t cap) {
     int rc = read_fd_text(fd, buf, cap);
     close(fd);
     return rc;
+}
+
+/* HTTP GET using libcurl */
+struct http_buf {
+    char *data;
+    size_t size;
+};
+
+static size_t http_write_cb(void *ptr, size_t size, size_t nmemb, void *userdata) {
+    struct http_buf *buf = userdata;
+    size_t total = size * nmemb;
+    if (buf->size + total + 1 > buf->size * 2) {
+        buf->size = (buf->size + total + 1) * 2;
+        buf->data = realloc(buf->data, buf->size);
+        if (!buf->data) return 0;
+    }
+    memcpy(buf->data + buf->size, ptr, total);
+    buf->size += total;
+    buf->data[buf->size] = 0;
+    return total;
+}
+
+static int http_get(const char *url, char *out, size_t cap, int timeout_ms) {
+    CURL *curl = curl_easy_init();
+    if (!curl) return -1;
+    struct http_buf buf = { .data = malloc(1024), .size = 0 };
+    if (!buf.data) { curl_easy_cleanup(curl); return -1; }
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, timeout_ms);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    CURLcode rc = curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_easy_cleanup(curl);
+    int ok = (rc == CURLE_OK && http_code == 200);
+    if (ok && buf.size > 0) {
+        size_t copy_len = buf.size < cap - 1 ? buf.size : cap - 1;
+        memcpy(out, buf.data, copy_len);
+        out[copy_len] = 0;
+    }
+    free(buf.data);
+    return ok ? 0 : -1;
+}
+
+/* Check if a TCP port is listening */
+static int check_port(int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return 0;
+    struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(port) };
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    int rc = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    close(fd);
+    return rc == 0;
+}
+
+/* Detect available AI servers */
+static void detect_ai_servers(SystemTelemetry *sys) {
+    sys->llama_available = check_port(8080);
+    sys->ollama_available = check_port(11434);
+    sys->vllm_available = check_port(8000);
+}
+
+/* Heuristic token rate estimation from GPU power */
+static void estimate_tokens_heuristic(SystemTelemetry *sys, double gpu_power_w) {
+    TokenRate *t = &sys->tokens;
+    
+    /* Store power in history */
+    t->power_history[t->power_history_idx] = gpu_power_w;
+    t->power_history_idx = (t->power_history_idx + 1) % 100;
+    
+    /* Calculate recent peak (last 2 seconds = 20 samples at 10Hz) */
+    double peak = 0;
+    for (int i = 0; i < 20; i++) {
+        int idx = (t->power_history_idx - i + 100) % 100;
+        if (t->power_history[idx] > peak) peak = t->power_history[idx];
+    }
+    t->recent_peak_w = peak;
+    
+    /* Detect decode phase: power is 40-80% of recent peak and steady */
+    double ratio = (peak > 0) ? gpu_power_w / peak : 0;
+    if (ratio >= 0.4 && ratio <= 0.8 && peak > 50) {
+        t->in_decode_phase = true;
+        t->decode_power_w = gpu_power_w;
+    } else if (ratio > 0.85) {
+        t->in_decode_phase = false;
+    }
+    
+    if (t->in_decode_phase) {
+        /* Estimate tokens/sec based on power
+         * Typical decode: ~30-50W per token/sec for modern GPUs
+         * This is a rough heuristic */
+        double decode_w = gpu_power_w;
+        double base_w = peak * 0.3;  /* Base power when idle */
+        double compute_w = decode_w - base_w;
+        t->tokens_per_sec = compute_w / 40.0;  /* ~40W per tok/s */
+        if (t->tokens_per_sec < 1) t->tokens_per_sec = 1;
+        if (t->tokens_per_sec > 200) t->tokens_per_sec = 200;
+        t->has_data = true;
+    } else {
+        t->tokens_per_sec = 0;
+        t->has_data = false;
+    }
+}
+
+/* Poll llama.cpp API for token stats */
+static void poll_llama_tokens(SystemTelemetry *sys) {
+    TokenRate *t = &sys->tokens;
+    char resp[4096];
+    if (http_get("http://127.0.0.1:8080/slots", resp, sizeof(resp), 500) != 0) {
+        t->has_data = false;
+        return;
+    }
+    /* Parse JSON - look for "tokens_per_second" */
+    char *p = strstr(resp, "\"tokens_per_second\"");
+    if (p) {
+        p = strchr(p, ':');
+        if (p) {
+            p++;
+            while (*p == ' ' || *p == '\t') p++;
+            t->tokens_per_sec = strtod(p, NULL);
+            t->has_data = true;
+        }
+    }
+    /* Also try prompt_tokens_per_second */
+    p = strstr(resp, "\"prompt_tokens_per_second\"");
+    if (p) {
+        p = strchr(p, ':');
+        if (p) {
+            p++;
+            while (*p == ' ' || *p == '\t') p++;
+            t->prompt_tokens_per_sec = strtod(p, NULL);
+        }
+    }
+}
+
+/* Poll Ollama API for token stats */
+static void poll_ollama_tokens(SystemTelemetry *sys) {
+    TokenRate *t = &sys->tokens;
+    char resp[4096];
+    if (http_get("http://127.0.0.1:11434/api/ps", resp, sizeof(resp), 500) != 0) {
+        t->has_data = false;
+        return;
+    }
+    /* Ollama /api/ps returns loaded models but not token rates
+     * We need to use /api/generate or track during generation
+     * For now, just mark as unavailable for real-time stats */
+    t->has_data = false;
+}
+
+/* Poll vLLM API for token stats */
+static void poll_vllm_tokens(SystemTelemetry *sys) {
+    TokenRate *t = &sys->tokens;
+    char resp[8192];
+    if (http_get("http://127.0.0.1:8000/metrics", resp, sizeof(resp), 500) != 0) {
+        t->has_data = false;
+        return;
+    }
+    /* Parse Prometheus metrics for vllm:generate_tokens_total or similar */
+    /* Look for vllm:num_requests_running or throughput metrics */
+    char *p = strstr(resp, "vllm:e2e_request_latency_seconds");
+    if (!p) {
+        /* Try alternative metric names */
+        p = strstr(resp, "vllm:time_to_first_token_seconds");
+    }
+    if (p) {
+        /* Found some vLLM metrics - estimate from request count */
+        t->has_data = true;
+        t->tokens_per_sec = 0; /* Would need more parsing */
+    } else {
+        t->has_data = false;
+    }
+}
+
+/* Main token rate sampling function */
+static void sample_tokens(SystemTelemetry *sys, double gpu_power_w) {
+    switch (sys->token_source) {
+        case TOKEN_SOURCE_HEURISTIC:
+            estimate_tokens_heuristic(sys, gpu_power_w);
+            snprintf(sys->tokens.source_label, sizeof(sys->tokens.source_label), "Heuristic");
+            break;
+        case TOKEN_SOURCE_LLAMA:
+            poll_llama_tokens(sys);
+            snprintf(sys->tokens.source_label, sizeof(sys->tokens.source_label), "llama.cpp");
+            break;
+        case TOKEN_SOURCE_OLLAMA:
+            poll_ollama_tokens(sys);
+            snprintf(sys->tokens.source_label, sizeof(sys->tokens.source_label), "Ollama");
+            break;
+        case TOKEN_SOURCE_VLLM:
+            poll_vllm_tokens(sys);
+            snprintf(sys->tokens.source_label, sizeof(sys->tokens.source_label), "vLLM");
+            break;
+    }
 }
 
 static int write_fd_text(int fd, const char *text) {
@@ -1342,6 +1610,179 @@ static void discover_cpu_temp(SystemTelemetry *s) {
     }
 }
 
+static void discover_cpu_fan(SystemTelemetry *s) {
+    if (s->cpu_fan_discovered) return;
+    s->cpu_fan_discovered = true;
+    s->fd_cpu_fan_rpm = -1;
+    s->fd_cpu_fan_pct = -1;
+
+    DIR *d = opendir("/sys/class/hwmon");
+    if (!d) return;
+    struct dirent *de;
+
+    while ((de = readdir(d))) {
+        if (strncmp(de->d_name, "hwmon", 5) != 0) continue;
+        char base[MAX_PATH_LEN], namep[MAX_PATH_LEN], name[64] = "";
+        if (!path_join(base, sizeof(base), "/sys/class/hwmon", de->d_name)) continue;
+        if (!path_join(namep, sizeof(namep), base, "name")) continue;
+        if (read_path_text(namep, name, sizeof(name)) < 0) continue;
+
+        /* Look for fan1_input (RPM) */
+        if (s->fd_cpu_fan_rpm < 0) {
+            char fanp[MAX_PATH_LEN];
+            if (path_join(fanp, sizeof(fanp), base, "fan1_input") && path_exists(fanp)) {
+                s->fd_cpu_fan_rpm = open(fanp, O_RDONLY | O_CLOEXEC);
+                if (s->fd_cpu_fan_rpm >= 0)
+                    text_copy(s->cpu_fan_rpm_path, sizeof(s->cpu_fan_rpm_path), fanp);
+            }
+        }
+        /* Look for pwm1 or fan1 for percentage */
+        if (s->fd_cpu_fan_pct < 0) {
+            char pwm[MAX_PATH_LEN];
+            if (path_join(pwm, sizeof(pwm), base, "pwm1") && path_exists(pwm)) {
+                s->fd_cpu_fan_pct = open(pwm, O_RDONLY | O_CLOEXEC);
+                if (s->fd_cpu_fan_pct >= 0)
+                    text_copy(s->cpu_fan_pct_path, sizeof(s->cpu_fan_pct_path), pwm);
+            }
+        }
+        if (s->fd_cpu_fan_rpm >= 0 && s->fd_cpu_fan_pct >= 0) break;
+    }
+    closedir(d);
+}
+
+static void discover_motherboard_temps(SystemTelemetry *s) {
+    if (s->mb_temp_discovered) return;
+    s->mb_temp_discovered = true;
+    s->mb_temp_count = 0;
+
+    DIR *d = opendir("/sys/class/hwmon");
+    if (!d) return;
+    struct dirent *de;
+
+    while ((de = readdir(d))) {
+        if (strncmp(de->d_name, "hwmon", 5) != 0) continue;
+        if (s->mb_temp_count >= 4) break;
+        char base[MAX_PATH_LEN], namep[MAX_PATH_LEN], name[64] = "";
+        if (!path_join(base, sizeof(base), "/sys/class/hwmon", de->d_name)) continue;
+        if (!path_join(namep, sizeof(namep), base, "name")) continue;
+        if (read_path_text(namep, name, sizeof(name)) < 0) continue;
+
+        /* Skip k10temp (CPU) and amdgpu */
+        if (strcasestr(name, "k10temp") || strcasestr(name, "zenpower") ||
+            strcasestr(name, "amdgpu")) continue;
+
+        /* Look for temp sensors that might be RAM or PCIe */
+        for (int ti = 1; ti <= 8 && s->mb_temp_count < 4; ti++) {
+            char inp[MAX_PATH_LEN], labp[MAX_PATH_LEN], label[64] = "", leaf[32];
+            snprintf(leaf, sizeof(leaf), "temp%d_input", ti);
+            if (!path_join(inp, sizeof(inp), base, leaf) || !path_exists(inp)) continue;
+            if (path_join(labp, sizeof(labp), base, leaf)) {
+                snprintf(leaf, sizeof(leaf), "temp%d_label", ti);
+                if (path_join(labp, sizeof(labp), base, leaf))
+                    (void)read_path_text(labp, label, sizeof(label));
+            }
+
+            int idx = s->mb_temp_count;
+            s->mb_temp_fds[idx] = open(inp, O_RDONLY | O_CLOEXEC);
+            if (s->mb_temp_fds[idx] < 0) continue;
+            text_copy(s->mb_temp_paths[idx], sizeof(s->mb_temp_paths[idx]), inp);
+            if (label[0])
+                text_copy(s->mb_temp_labels[idx], sizeof(s->mb_temp_labels[idx]), label);
+            else
+                snprintf(s->mb_temp_labels[idx], sizeof(s->mb_temp_labels[idx]), "%s T%d", name, ti);
+            s->mb_temp_count++;
+        }
+    }
+    closedir(d);
+}
+
+static void sample_top_processes(SystemTelemetry *s) {
+    s->top_proc_count = 0;
+
+    /* Read /proc/[pid]/stat for CPU times and /proc/[pid]/comm for names */
+    DIR *d = opendir("/proc");
+    if (!d) return;
+
+    /* Simple approach: read /proc/[pid]/stat, compute CPU usage */
+    struct { pid_t pid; char name[16]; unsigned long long utime, stime; } procs[256];
+    int proc_count = 0;
+
+    struct dirent *de;
+    while ((de = readdir(d)) && proc_count < 256) {
+        if (!isdigit(de->d_name[0])) continue;
+        pid_t pid = atoi(de->d_name);
+
+        char statp[MAX_PATH_LEN], commp[MAX_PATH_LEN];
+        snprintf(statp, sizeof(statp), "/proc/%d/stat", pid);
+        snprintf(commp, sizeof(commp), "/proc/%d/comm", pid);
+
+        char statbuf[512];
+        if (read_path_text(statp, statbuf, sizeof(statbuf)) < 0) continue;
+
+        /* Parse utime and stime (fields 14 and 15) */
+        char *p = strchr(statbuf, ')');
+        if (!p) continue;
+        p++;
+        unsigned long long utime = 0, stime = 0;
+        int field = 0;
+        char *tok = p;
+        while (*tok && field < 14) {
+            tok = strchr(tok, ' ');
+            if (!tok) break;
+            tok++;
+            field++;
+        }
+        if (*tok) {
+            utime = strtoull(tok, &tok, 10);
+            if (*tok == ' ') {
+                tok++;
+                stime = strtoull(tok, NULL, 10);
+            }
+        }
+
+        char comm[16] = "";
+        read_path_text(commp, comm, sizeof(comm));
+        /* Strip newline */
+        comm[strcspn(comm, "\n")] = 0;
+
+        procs[proc_count].pid = pid;
+        text_copy(procs[proc_count].name, sizeof(procs[proc_count].name), comm);
+        procs[proc_count].utime = utime;
+        procs[proc_count].stime = stime;
+        proc_count++;
+    }
+    closedir(d);
+
+    /* Sort by total CPU time (descending) and take top 3 */
+    for (int i = 0; i < proc_count - 1; i++) {
+        for (int j = i + 1; j < proc_count; j++) {
+            if (procs[j].utime + procs[j].stime > procs[i].utime + procs[i].stime) {
+                struct { pid_t pid; char name[16]; unsigned long long utime, stime; } tmp;
+                tmp.pid = procs[i].pid;
+                text_copy(tmp.name, sizeof(tmp.name), procs[i].name);
+                tmp.utime = procs[i].utime;
+                tmp.stime = procs[i].stime;
+                procs[i].pid = procs[j].pid;
+                text_copy(procs[i].name, sizeof(procs[i].name), procs[j].name);
+                procs[i].utime = procs[j].utime;
+                procs[i].stime = procs[j].stime;
+                procs[j].pid = tmp.pid;
+                text_copy(procs[j].name, sizeof(procs[j].name), tmp.name);
+                procs[j].utime = tmp.utime;
+                procs[j].stime = tmp.stime;
+            }
+        }
+    }
+
+    int take = proc_count < 3 ? proc_count : 3;
+    for (int i = 0; i < take; i++) {
+        s->top_procs[i].pid = procs[i].pid;
+        text_copy(s->top_procs[i].name, sizeof(s->top_procs[i].name), procs[i].name);
+        s->top_procs[i].cpu_pct = 0.0; /* Simplified: just show the process */
+    }
+    s->top_proc_count = take;
+}
+
 static void sample_system(SystemTelemetry *s) {
     FILE *f = fopen("/proc/stat", "r");
     if (f) {
@@ -1388,6 +1829,34 @@ static void sample_system(SystemTelemetry *s) {
     discover_cpu_temp(s);
     long cpu_mc = read_long_fd(s->fd_cpu_temp, -1);
     s->cpu_temp_c = cpu_mc >= 0 ? cpu_mc / 1000.0 : -1.0;
+
+    /* CPU fan */
+    discover_cpu_fan(s);
+    if (s->fd_cpu_fan_rpm >= 0) {
+        long rpm = read_long_fd(s->fd_cpu_fan_rpm, -1);
+        s->cpu_fan_rpm = rpm >= 0 ? (int)rpm : 0;
+    }
+    if (s->fd_cpu_fan_pct >= 0) {
+        long pwm = read_long_fd(s->fd_cpu_fan_pct, -1);
+        long pwm_max = 255;
+        /* Try to read pwm1_max */
+        char maxp[MAX_PATH_LEN];
+        if (path_join(maxp, sizeof(maxp), dirname(s->cpu_fan_pct_path), "pwm1_max")) {
+            long m = read_long_fd(open(maxp, O_RDONLY | O_CLOEXEC), -1);
+            if (m > 0) pwm_max = m;
+        }
+        s->cpu_fan_pct = pwm >= 0 && pwm_max > 0 ? (double)pwm * 100.0 / (double)pwm_max : 0.0;
+    }
+
+    /* Motherboard temps */
+    discover_motherboard_temps(s);
+    for (int i = 0; i < s->mb_temp_count; i++) {
+        long mc = read_long_fd(s->mb_temp_fds[i], -1);
+        s->mb_temp_c[i] = mc >= 0 ? mc / 1000.0 : -1.0;
+    }
+
+    /* Top processes */
+    sample_top_processes(s);
 }
 
 
@@ -2457,6 +2926,20 @@ static void gui_outline(Gui *ui, Rect r, unsigned long color) {
     XDrawRectangle(ui->dpy, ui->win, ui->gc, r.x, r.y, (unsigned)(r.w - 1), (unsigned)(r.h - 1));
 }
 
+static unsigned long color_luminance(unsigned long c) {
+    /* Extract RGB components from X11 pixel value */
+    unsigned char r = (c >> 16) & 0xFF;
+    unsigned char g = (c >> 8) & 0xFF;
+    unsigned char b = c & 0xFF;
+    /* Relative luminance formula */
+    return (unsigned long)((r * 299 + g * 587 + b * 114) / 1000);
+}
+
+static unsigned long contrast_text_color(Gui *ui, unsigned long bg_color) {
+    /* Return dark text for light backgrounds, light text for dark backgrounds */
+    return color_luminance(bg_color) > 128 ? ui->text_dark : ui->fg;
+}
+
 static void gui_bar(Gui *ui, Rect r, double pct, const char *label) {
     if (pct < 0.0) pct = 0.0;
     if (pct > 100.0) pct = 100.0;
@@ -2465,7 +2948,7 @@ static void gui_bar(Gui *ui, Rect r, double pct, const char *label) {
     fill.w = (int)((double)r.w * pct / 100.0);
     gui_fill(ui, fill, ui->accent);
     gui_outline(ui, r, ui->dim);
-    if (label && *label) gui_text(ui, r.x + 6, r.y + r.h - 6, ui->fg, true, "%s", label);
+    if (label && *label) gui_text(ui, r.x + 6, r.y + r.h - 6, contrast_text_color(ui, ui->accent), true, "%s", label);
 }
 
 static void gui_bar_color(Gui *ui, Rect r, double pct, const char *label,
@@ -2477,7 +2960,7 @@ static void gui_bar_color(Gui *ui, Rect r, double pct, const char *label,
     fill.w = (int)((double)r.w * pct / 100.0);
     gui_fill(ui, fill, fill_color);
     gui_outline(ui, r, ui->dim);
-    if (label && *label) gui_text(ui, r.x + 6, r.y + r.h - 6, ui->fg, true, "%s", label);
+    if (label && *label) gui_text(ui, r.x + 6, r.y + r.h - 6, contrast_text_color(ui, fill_color), true, "%s", label);
 }
 
 static void gui_bar_color_text(Gui *ui, Rect r, double pct, const char *label,
@@ -2652,11 +3135,11 @@ static int gui_init(Gui *ui, SessionInfo *si) {
     XSetWMNormalHints(ui->dpy, ui->win, &hints);
 
     ui->gc = XCreateGC(ui->dpy, ui->win, 0, NULL);
-    ui->font = XLoadQueryFont(ui->dpy, "10x20");
-    if (!ui->font) ui->font = XLoadQueryFont(ui->dpy, "9x15");
+    ui->font = XLoadQueryFont(ui->dpy, "12x24");
+    if (!ui->font) ui->font = XLoadQueryFont(ui->dpy, "10x20");
     if (!ui->font) ui->font = XLoadQueryFont(ui->dpy, "fixed");
-    ui->font_bold = XLoadQueryFont(ui->dpy, "10x20bold");
-    if (!ui->font_bold) ui->font_bold = XLoadQueryFont(ui->dpy, "9x15bold");
+    ui->font_bold = XLoadQueryFont(ui->dpy, "12x24bold");
+    if (!ui->font_bold) ui->font_bold = XLoadQueryFont(ui->dpy, "10x20bold");
     if (!ui->font_bold) ui->font_bold = ui->font;
     gui_set_font(ui, false);
     XMapWindow(ui->dpy, ui->win);
@@ -2699,6 +3182,18 @@ static Rect mode_rect(const Gui *ui, int idx) {
     return (Rect){x0 + idx * (w + gap), y, w, h};
 }
 
+static Rect workflow_rect(const Gui *ui, int idx) {
+    int w = 130, h = 34, gap = 8;
+    int x = ui->width - 16 - w - gap - w + idx * (w + gap);
+    return (Rect){x, 10, w, h};
+}
+
+static Rect token_source_rect(const Gui *ui) {
+    int w = 140, h = 34;
+    int x = ui->width - 16 - 130 - 8 - 130 - 8 - w;
+    return (Rect){x, 10, w, h};
+}
+
 static Rect tuning_minus_rect(const Gui *ui, int row) {
     return (Rect){ui->width - 190, 520 + row * 68, 72, 30};
 }
@@ -2725,6 +3220,26 @@ static void draw_header(Gui *ui, const Gpu *g, Sysfs *s, const Target *t,
                         const PowerTelemetry *p, const SystemTelemetry *sys,
                         const Stats *st) {
     gui_text(ui, 16, 25, ui->fg, true, "%s", g->full_name);
+
+    /* Workflow mode buttons */
+    Rect ai_btn = workflow_rect(ui, 0);
+    Rect game_btn = workflow_rect(ui, 1);
+    bool ai_active = (g_workflow == WORKFLOW_AI);
+    bool game_active = (g_workflow == WORKFLOW_GAMING);
+    draw_button(ui, ai_btn, "AI Workflow", ai_active);
+    draw_button(ui, game_btn, "Gaming Workflow", game_active);
+
+    /* Token source button */
+    Rect tok_btn = token_source_rect(ui);
+    char tok_label[64];
+    switch (g_token_source) {
+        case TOKEN_SOURCE_HEURISTIC: snprintf(tok_label, sizeof(tok_label), "Tok: Heuristic"); break;
+        case TOKEN_SOURCE_LLAMA: snprintf(tok_label, sizeof(tok_label), "Tok: llama.cpp"); break;
+        case TOKEN_SOURCE_OLLAMA: snprintf(tok_label, sizeof(tok_label), "Tok: Ollama"); break;
+        case TOKEN_SOURCE_VLLM: snprintf(tok_label, sizeof(tok_label), "Tok: vLLM"); break;
+        default: snprintf(tok_label, sizeof(tok_label), "Tok: Auto"); break;
+    }
+    draw_button(ui, tok_btn, tok_label, false);
     gui_text(ui, 16, 47, ui->dim, false,
              "%s  |  PCI %s  |  ID 1002:%s  |  VRAM %.1f GiB",
              g->card_name, g->pci_addr, g->device_id, g->vram_bytes / 1073741824.0);
@@ -2745,8 +3260,10 @@ static void draw_header(Gui *ui, const Gpu *g, Sysfs *s, const Target *t,
         draw_button(ui, mode_rect(ui, i), modes[i], strcmp(t->policy, POLICIES[i]) == 0);
 
     char label[192];
-    double power_scale = p->power_cap_max_w > 1.0 ? p->power_cap_max_w : POWER_BAR_MAX_W;
-    if (power_scale < 100.0) power_scale = POWER_BAR_MAX_W;
+    double power_scale = POWER_BAR_MAX_W;
+    if (p->power_cap_max_w > 1.0 && p->power_cap_max_w < power_scale)
+        power_scale = p->power_cap_max_w;
+    if (power_scale < 400.0) power_scale = 400.0;
     Rect power_bar = {16, 119, ui->width - 32, 42};
     double power_pct = p->power_w >= 0.0 ? p->power_w * 100.0 / power_scale : 0.0;
     if (p->power_w >= 0.0 && p->power_cap_w > 0.0)
@@ -2865,11 +3382,10 @@ static void panel_title(Gui *ui, Rect r, const char *title) {
 static void draw_dashboard(Gui *ui, const Target *t, const Stats *st, int interval_us,
                            bool adaptive, bool monitor_clocks, const ClientMonitor *cm,
                            const PowerTelemetry *p, const SessionInfo *si, const EventLog *el,
-                           const TraceState *tr) {
+                           const TraceState *tr, const SystemTelemetry *sys) {
     int top = 377, gap = 10, margin = 12;
     int w = (ui->width - margin * 2 - gap) / 2;
-    int bottom = ui->height - 82;
-    int h = (bottom - top - gap * 2) / 3;
+    int h = 90;
     Rect r[6] = {
         {margin, top, w, h}, {margin + w + gap, top, w, h},
         {margin, top + h + gap, w, h}, {margin + w + gap, top + h + gap, w, h},
@@ -2881,7 +3397,9 @@ static void draw_dashboard(Gui *ui, const Target *t, const Stats *st, int interv
 
     panel_title(ui, r[1], "POWER / CLOCKS");
     gui_text(ui,r[1].x+10,r[1].y+45,ui->fg,false,"GPU %d%%  MEM %d%%  %.1f W  %.1f C",p->gpu_busy,p->mem_busy,p->power_w,p->temp_c);
-    if (p->gfx_hz >= 0 && p->gfx_hz_max > 0 && p->mem_hz >= 0 && p->mem_hz_max > 0) {
+    if (sys->tokens.has_data) {
+        gui_text(ui,r[1].x+10,r[1].y+68,ui->accent,false,"~%.0f tok/s (%s)",sys->tokens.tokens_per_sec,sys->tokens.source_label);
+    } else if (p->gfx_hz >= 0 && p->gfx_hz_max > 0 && p->mem_hz >= 0 && p->mem_hz_max > 0) {
         gui_text(ui,r[1].x+10,r[1].y+68,ui->dim,false,
                  "GFX %.0f/%.0f MHz  MEM %.0f/%.0f MHz",
                  p->gfx_hz/1000000.0, p->gfx_hz_max,
@@ -2911,6 +3429,14 @@ static void draw_dashboard(Gui *ui, const Target *t, const Stats *st, int interv
     panel_title(ui, r[5], "TRACE / LOG");
     gui_text(ui,r[5].x+10,r[5].y+45,ui->fg,false,"Kernel trace %s   lines %llu",tr->active?"ON":"off",(unsigned long long)tr->lines);
     gui_text(ui,r[5].x+10,r[5].y+68,ui->dim,false,"CSV log %s   events %llu",el->logging?"ON":"off",(unsigned long long)el->total);
+
+    /* Top CPU processes */
+    int ty = top + 3*(h+gap);
+    panel_title(ui, (Rect){margin, ty, ui->width - margin*2, 70}, "TOP CPU PROCESSES");
+    for (int i = 0; i < sys->top_proc_count; i++) {
+        gui_text(ui, margin + 10 + i * 300, ty + 45, ui->fg, false,
+                 "#%d PID %d %s", i+1, sys->top_procs[i].pid, sys->top_procs[i].name);
+    }
 }
 
 static void draw_clients_page(Gui *ui, const ClientMonitor *cm) {
@@ -2937,6 +3463,9 @@ static void draw_power_page(Gui *ui, const Target *t, const Stats *st, const Pow
     gui_text(ui,x,y,ui->fg,false,"GPU busy %d%%   MEM busy %d%%   board power %.2f W",p->gpu_busy,p->mem_busy,p->power_w); y+=24;
     gui_text(ui,x,y,ui->fg,false,"Power cap %.1f W   firmware range %.1f - %.1f W",
              p->power_cap_w,p->power_cap_min_w,p->power_cap_max_w); y+=24;
+    if (sys->tokens.has_data) {
+        gui_text(ui,x,y,ui->accent,false,"Token rate: ~%.0f tok/s (%s)",sys->tokens.tokens_per_sec,sys->tokens.source_label); y+=24;
+    }
 
     for (int i=0;i<MAX_GPU_TEMPS;i++) {
         if (p->temps_c[i] < 0.0) continue;
@@ -2950,6 +3479,18 @@ static void draw_power_page(Gui *ui, const Target *t, const Stats *st, const Pow
         double crit=sys->cpu_temp_crit_mc>0?sys->cpu_temp_crit_mc/1000.0:-1.0;
         gui_text(ui,x,y,tune_zone_color(ui,temperature_zone(sys->cpu_temp_c,sys->cpu_temp_crit_mc,-1)),true,
                  "CPU %s %.1f C   crit %.1f C",sys->cpu_temp_label,sys->cpu_temp_c,crit); y+=23;
+    }
+
+    /* CPU fan */
+    if (sys->cpu_fan_rpm > 0 || sys->cpu_fan_pct > 0.0) {
+        gui_text(ui,x,y,ui->fg,true,"CPU Fan %d RPM / %.1f%%",sys->cpu_fan_rpm,sys->cpu_fan_pct); y+=23;
+    }
+
+    /* Motherboard temps */
+    for (int i=0;i<sys->mb_temp_count;i++) {
+        if (sys->mb_temp_c[i] >= 0.0) {
+            gui_text(ui,x,y,ui->fg,false,"MB %s %.1f C",sys->mb_temp_labels[i],sys->mb_temp_c[i]); y+=23;
+        }
     }
 
     gui_text(ui,x,y,ui->fg,false,"Fan %d RPM / %.1f%%   voltage %.3f V",p->fan_rpm,p->fan_pct,p->voltage_v); y+=24;
@@ -3142,12 +3683,14 @@ static void draw_about_page(Gui *ui) {
 
     gui_text(ui, x, y, ui->accent, true, "AMD GPU Performance and Diagnostic Tool"); y += 32;
     gui_text(ui, x, y, ui->fg, true, "Version %s", VERSION); y += 26;
-    gui_text(ui, x, y, ui->fg, false, "Developer: Kevin"); y += 24;
-    gui_text(ui, x, y, ui->dim, false, "Copyright (C) 2026 Kevin Kolasa"); y += 34;
+    gui_text(ui, x, y, ui->fg, false, "GitHub: kevito666"); y += 24;
+    gui_text(ui, x, y, ui->fg, false, "Username: satan"); y += 24;
+    gui_text(ui, x, y, ui->fg, false, "Build: %s", __DATE__); y += 24;
+    gui_text(ui, x, y, ui->dim, false, "(C) 2026 kevito666 (github)"); y += 34;
 
     gui_text(ui, x, y, ui->accent, true, "About the project"); y += 28;
     gui_text(ui, x, y, ui->fg, false,
-             "Independent Linux AMDGPU diagnostic software developed in Akita City, Japan."); y += 22;
+             "Independent Linux AMDGPU diagnostic software."); y += 22;
     gui_text(ui, x, y, ui->fg, false,
              "The project grew from investigating rapid AMDGPU power-state changes, desktop/game"); y += 22;
     gui_text(ui, x, y, ui->fg, false,
@@ -3198,7 +3741,7 @@ static void gui_draw(Gui *ui, const Gpu *g, Sysfs *s, const Target *t, const Sta
     draw_header(ui,g,s,t,power,system,st);
     draw_tabs(ui,view);
     switch(view) {
-        case VIEW_DASHBOARD: draw_dashboard(ui,t,st,interval_us,adaptive,monitor_clocks,clients,power,session,events,trace); break;
+        case VIEW_DASHBOARD: draw_dashboard(ui,t,st,interval_us,adaptive,monitor_clocks,clients,power,session,events,trace,system); break;
         case VIEW_CLIENTS: draw_clients_page(ui,clients); break;
         case VIEW_POWER: draw_power_page(ui,t,st,power,s,system,monitor_clocks,dpm_interval_us); break;
         case VIEW_TUNING: draw_tuning_page(ui,tuning); break;
@@ -3363,6 +3906,30 @@ static void handle_click(Gui *ui, int x, int y, Sysfs *s, Target *target, Tuning
                          int *interval_us, int *dpm_interval_us, bool *monitor_clocks, bool *adaptive,
                          long long *burst_until_ns, TraceState *trace, EventLog *events,
                          View *view, char *message, size_t message_cap) {
+    /* Workflow mode buttons */
+    if(point_in(workflow_rect(ui, 0), x, y)) {
+        g_workflow = WORKFLOW_AI;
+        snprintf(message, message_cap, "AI Workflow mode");
+        return;
+    }
+    if(point_in(workflow_rect(ui, 1), x, y)) {
+        g_workflow = WORKFLOW_GAMING;
+        snprintf(message, message_cap, "Gaming Workflow mode");
+        return;
+    }
+
+    /* Token source button - cycle through sources */
+    if(point_in(token_source_rect(ui), x, y)) {
+        g_token_source = (TokenSource)((g_token_source + 1) % 4);
+        switch (g_token_source) {
+            case TOKEN_SOURCE_HEURISTIC: snprintf(message, message_cap, "Token source: Heuristic"); break;
+            case TOKEN_SOURCE_LLAMA: snprintf(message, message_cap, "Token source: llama.cpp"); break;
+            case TOKEN_SOURCE_OLLAMA: snprintf(message, message_cap, "Token source: Ollama"); break;
+            case TOKEN_SOURCE_VLLM: snprintf(message, message_cap, "Token source: vLLM"); break;
+        }
+        return;
+    }
+
     for(int i=0;i<9;i++) {
         if(point_in(tab_rect(ui,i),x,y)) {
             *view=(View)i;
@@ -3472,6 +4039,12 @@ int main(int argc, char **argv) {
     TuningState tuning={0};
     tuning.spec=gpu_spec_match(g->full_name,g->vram_bytes);
     SessionInfo session={0}; EventLog events={0}; TraceState trace; trace_discover(&trace);
+    
+    /* Initialize curl and detect AI servers */
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    system.token_source = TOKEN_SOURCE_HEURISTIC;
+    detect_ai_servers(&system);
+    
     sample_power(&s,&power); sample_system(&system); sample_clients(g,&clients); sample_session(g,&s,&session,&clients);
     tuning_refresh(&s,&tuning,true);
 
@@ -3508,7 +4081,7 @@ int main(int argc, char **argv) {
             if(oldpw>=0&&power.power_w>=0&&fabs(power.power_w-oldpw)>30.0){char d[128];snprintf(d,sizeof(d),"%.1f W -> %.1f W",oldpw,power.power_w);event_log_add(&events,"POWER STEP",d,&clients,&trace);}
             next_power=loop_now;add_ns(&next_power,POWER_SAMPLE_NS);ui.dirty=true;
         }
-        if(diff_ns(loop_now,next_system)>=0){sample_system(&system);next_system=loop_now;add_ns(&next_system,SYSTEM_SAMPLE_NS);ui.dirty=true;}
+        if(diff_ns(loop_now,next_system)>=0){sample_system(&system);system.token_source=g_token_source;sample_tokens(&system,power.power_w);next_system=loop_now;add_ns(&next_system,SYSTEM_SAMPLE_NS);ui.dirty=true;}
         if(diff_ns(loop_now,next_session)>=0){sample_session(g,&s,&session,&clients);x11_probe_session(&ui,&session);next_session=loop_now;add_ns(&next_session,SESSION_SAMPLE_NS);ui.dirty=true;}
         trace_pump(&trace);
 
