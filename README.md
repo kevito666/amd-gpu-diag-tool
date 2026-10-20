@@ -4,7 +4,7 @@ A lightweight X11/XLibre GUI for AMDGPU power-policy locking and diagnostics on 
 
 The application is written in C and uses plain Xlib for the interface. It intentionally avoids GTK, Qt, Electron, ncurses, libdrm, XCB as a direct dependency, and other GUI frameworks. The diagnostic core talks directly to Linux sysfs, procfs, debugfs, tracefs, and DRM fdinfo interfaces.
 
-**Version:** 0.5.2  
+**Version:** 0.6.0  
 **License:** GPL-3.0-or-later
 
 ## Designed for
@@ -18,7 +18,7 @@ Wayland is not a target of this GUI build.
 - AMDGPU power-policy watchdog with `profile_standard` as the default target.
 - Adaptive correction: low-overhead steady polling with a short faster burst after an actual policy reset.
 - Prominent top-of-window power-mode selector with clickable modes and keyboard shortcuts.
-- A dominant full-width board-power bar plus always-visible bars for GPU load, VRAM, CPU load, system RAM, GPU voltage, and current.
+- A dominant full-width board-power bar, a prominent multi-sensor thermal strip, and always-visible bars for GPU load, VRAM, CPU load, system RAM, GPU voltage, and current.
 - Live temperature, fan RPM/percentage, board power, GFX clock, and memory clock.
 - Uses a real hwmon current sensor when available; otherwise shows an explicitly labelled 12 V board-current estimate from `board_power / 12 V`.
 - Per-process DRM activity attribution.
@@ -28,16 +28,21 @@ Wayland is not a target of this GUI build.
 - Diagnostic event flight recorder and optional CSV logging.
 - Optional isolated tracefs diagnostics.
 - Manual GFX/MEM DPM-level cycling.
+- Guarded software tuning page for firmware-exposed GFX clocks/offsets, memory clocks, VDDGFX offset, and board power cap.
+- Two-step ARM → APPLY write gate plus RESET STOCK and REFRESH controls.
+- Green / amber / red aggressiveness zones based on captured stock values and firmware ranges; colors are not a hardware-safety guarantee.
+- Embedded reference database covering 50 desktop Radeon models from RX 400/500 and Vega through RX 5000/6000/7000/9000.
 - Event-driven Xlib GUI with no animation/render loop.
 
 ## Runtime footprint
 
-The GUI directly links only to:
+The executable directly links to:
 
 - `libX11`
+- `libm` (part of glibc on Arch Linux)
 - `libc`
 
-The current optimized binary is roughly 80 KiB on the development build system. Runtime size varies slightly by compiler/toolchain.
+Xlib brings its normal X11 transport dependencies indirectly. No GTK, Qt, Electron, libdrm, Python runtime, or other GUI toolkit is required. Runtime size varies slightly by compiler/toolchain.
 
 ## Arch Linux requirements
 
@@ -48,6 +53,26 @@ sudo pacman -S --needed base-devel libx11
 ```
 
 No GTK or Qt packages are required.
+
+## Tuning controls
+
+The **Tuning** page uses Linux AMDGPU interfaces directly. It does not replace the driver or firmware safety mechanisms.
+
+The program treats the ranges exported by `pp_od_clk_voltage` and `power1_cap_min` / `power1_cap_max` as the absolute write boundaries. The embedded GPU database supplies reference boost/game clocks, board power, memory configuration, and architecture context only.
+
+The color bands mean:
+
+- **green** — at or below the captured stock/reference operating point
+- **amber** — above stock but not near the exported firmware ceiling
+- **red** — aggressive setting near the top of the exported driver/firmware range
+
+These colors are an aggressiveness guide, **not a guarantee that a setting is stable, thermally safe, or safe for every partner board**.
+
+Writes are deliberately two-step: click **ARM WRITES**, then **APPLY**. The application disarms writes immediately after an apply attempt. **RESET STOCK** asks the AMDGPU overdrive interface to reset and restores the power cap captured at startup.
+
+Older multi-state Polaris/Vega10 overdrive tables are not forced into the modern min/max slider model. They remain read-only in this page unless a control can be represented unambiguously; power-cap controls still appear when the driver exposes them.
+
+See [`docs/GPU_DATABASE.md`](docs/GPU_DATABASE.md) for database scope and provenance.
 
 ## Build
 
@@ -77,6 +102,7 @@ The application deliberately lowers its process priority by default so audio and
 The top control/status block keeps power control and physical system state visible on every page:
 
 - full GPU name
+- all AMDGPU temperature channels exposed by hwmon (typically edge, junction/hotspot, and memory) plus CPU package temperature when available
 - DRM card / PCI address / PCI ID
 - total VRAM
 - requested vs actual AMDGPU policy and the eight power-mode buttons
@@ -136,8 +162,8 @@ The program deliberately separates inexpensive enforcement from expensive teleme
 - Adaptive correction burst: 500 us / 2 kHz for 250 ms after a real mismatch.
 - Basic GPU hardware telemetry: 10 Hz.
 - CPU/RAM telemetry: 2 Hz.
-- Per-process DRM accounting: 2 Hz.
-- Desktop/display discovery: 0.2 Hz.
+- Per-process DRM accounting: 1 Hz.
+- Desktop/display discovery: 0.1 Hz.
 - Expensive `pp_dpm_*` sampling: off by default.
 - Kernel tracing: off by default.
 - GUI redraw: at most 4 Hz and only when dirty.

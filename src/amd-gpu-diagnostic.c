@@ -31,7 +31,9 @@
 #include <X11/keysym.h>
 #include <sys/time.h>
 
-#define VERSION "0.5.2"
+#include "gpu_specs.h"
+
+#define VERSION "0.6.0"
 #define MAX_PATH_LEN 512
 #define MAX_TEXT 4096
 #define MAX_LEVELS 32
@@ -46,9 +48,9 @@
 #define ADAPTIVE_BURST_INTERVAL_US 500
 #define ADAPTIVE_BURST_NS 250000000LL
 
-#define CLIENT_SAMPLE_NS 500000000LL
+#define CLIENT_SAMPLE_NS 1000000000LL
 #define POWER_SAMPLE_NS 100000000LL
-#define SESSION_SAMPLE_NS 5000000000LL
+#define SESSION_SAMPLE_NS 10000000000LL
 #define SYSTEM_SAMPLE_NS 500000000LL
 #define NOMINAL_BOARD_VOLTAGE 12.0
 #define VOLTAGE_BAR_MAX_V 1.20
@@ -58,6 +60,7 @@
 #define MAX_DIAG_EVENTS 96
 #define MAX_TRACE_LINE 512
 #define MAX_CONNECTORS 12
+#define MAX_GPU_TEMPS 3
 
 typedef struct {
     int card_num;
@@ -86,7 +89,10 @@ typedef struct {
     int fd_mclk_w;
     int fd_busy;
     int fd_mem_busy;
-    int fd_temp;
+    int fd_temp[MAX_GPU_TEMPS];
+    int temp_count;
+    long temp_crit_mc[MAX_GPU_TEMPS];
+    long temp_emergency_mc[MAX_GPU_TEMPS];
     int fd_power;
     int fd_freq1;
     int fd_freq2;
@@ -98,13 +104,24 @@ typedef struct {
     int fd_vram_used;
     int fd_power_profile;
     int fd_pcie_bw;
+    int fd_power_cap_r;
+    int fd_power_cap_w;
+    int fd_power_cap_min;
+    int fd_power_cap_max;
+    int fd_od_r;
+    int fd_od_w;
     char policy_path[MAX_PATH_LEN];
     char sclk_path[MAX_PATH_LEN];
     char mclk_path[MAX_PATH_LEN];
     char busy_path[MAX_PATH_LEN];
     char mem_busy_path[MAX_PATH_LEN];
-    char temp_path[MAX_PATH_LEN];
+    char temp_path[MAX_GPU_TEMPS][MAX_PATH_LEN];
+    char temp_label[MAX_GPU_TEMPS][32];
     char power_path[MAX_PATH_LEN];
+    char power_cap_path[MAX_PATH_LEN];
+    char power_cap_min_path[MAX_PATH_LEN];
+    char power_cap_max_path[MAX_PATH_LEN];
+    char od_path[MAX_PATH_LEN];
     char freq1_path[MAX_PATH_LEN];
     char freq2_path[MAX_PATH_LEN];
     char freq1_label[32];
@@ -163,6 +180,7 @@ typedef enum {
     VIEW_DASHBOARD = 0,
     VIEW_CLIENTS,
     VIEW_POWER,
+    VIEW_TUNING,
     VIEW_DESKTOP,
     VIEW_EVENTS,
     VIEW_TRACE,
@@ -222,7 +240,12 @@ typedef struct {
     int gpu_busy;
     int mem_busy;
     double temp_c;
+    double temps_c[MAX_GPU_TEMPS];
+    int temp_count;
     double power_w;
+    double power_cap_w;
+    double power_cap_min_w;
+    double power_cap_max_w;
     double voltage_v;
     double current_a;
     double equivalent_input_ohm;
@@ -257,7 +280,68 @@ typedef struct {
     unsigned long long prev_cpu_total;
     unsigned long long prev_cpu_idle;
     bool have_cpu_sample;
+    int fd_cpu_temp;
+    char cpu_temp_path[MAX_PATH_LEN];
+    char cpu_temp_label[32];
+    double cpu_temp_c;
+    long cpu_temp_crit_mc;
+    bool cpu_temp_discovered;
 } SystemTelemetry;
+
+typedef enum {
+    TUNE_ZONE_SAFE = 0,
+    TUNE_ZONE_WARNING,
+    TUNE_ZONE_DANGER,
+    TUNE_ZONE_UNAVAILABLE
+} TuneZone;
+
+typedef struct {
+    bool available;
+    bool armed;
+    bool has_sclk;
+    bool sclk_max_only;
+    bool has_sclk_offset;
+    bool sclk_offset_legacy;
+    bool has_mclk;
+    bool mclk_max_only;
+    bool has_vdd_offset;
+    bool has_power_cap;
+    long sclk_min_mhz;
+    long sclk_max_mhz;
+    long sclk_limit_min_mhz;
+    long sclk_limit_max_mhz;
+    long sclk_offset_mhz;
+    long sclk_offset_min_mhz;
+    long sclk_offset_max_mhz;
+    long mclk_min_mhz;
+    long mclk_max_mhz;
+    long mclk_limit_min_mhz;
+    long mclk_limit_max_mhz;
+    long vdd_offset_mv;
+    long vdd_offset_min_mv;
+    long vdd_offset_max_mv;
+    double power_cap_w;
+    double power_cap_min_w;
+    double power_cap_max_w;
+
+    long default_sclk_min_mhz;
+    long default_sclk_max_mhz;
+    long default_sclk_offset_mhz;
+    long default_mclk_min_mhz;
+    long default_mclk_max_mhz;
+    long default_vdd_offset_mv;
+    double default_power_cap_w;
+
+    long edit_sclk_min_mhz;
+    long edit_sclk_max_mhz;
+    long edit_sclk_offset_mhz;
+    long edit_mclk_max_mhz;
+    long edit_vdd_offset_mv;
+    double edit_power_cap_w;
+
+    bool initialized;
+    const GpuSpec *spec;
+} TuningState;
 
 typedef struct {
     struct timespec when;
@@ -555,13 +639,29 @@ static int choose_gpu(Gpu *gpus, int count, int requested_card) {
 
 static void sysfs_close(Sysfs *s) {
     int *fds[] = {&s->fd_policy_r,&s->fd_policy_w,&s->fd_sclk_r,&s->fd_sclk_w,
-                  &s->fd_mclk_r,&s->fd_mclk_w,&s->fd_busy,&s->fd_mem_busy,&s->fd_temp,&s->fd_power,
+                  &s->fd_mclk_r,&s->fd_mclk_w,&s->fd_busy,&s->fd_mem_busy,&s->fd_power,
                   &s->fd_freq1,&s->fd_freq2,&s->fd_fan_rpm,&s->fd_pwm,&s->fd_pwm_max,&s->fd_voltage,&s->fd_current,
-                  &s->fd_vram_used,&s->fd_power_profile,&s->fd_pcie_bw};
+                  &s->fd_vram_used,&s->fd_power_profile,&s->fd_pcie_bw,
+                  &s->fd_power_cap_r,&s->fd_power_cap_w,&s->fd_power_cap_min,&s->fd_power_cap_max,
+                  &s->fd_od_r,&s->fd_od_w};
     for (size_t i = 0; i < sizeof(fds)/sizeof(fds[0]); i++) {
         if (*fds[i] >= 0) close(*fds[i]);
         *fds[i] = -1;
     }
+    for (int i = 0; i < MAX_GPU_TEMPS; i++) {
+        if (s->fd_temp[i] >= 0) close(s->fd_temp[i]);
+        s->fd_temp[i] = -1;
+    }
+}
+
+static long read_optional_long_path(const char *path, long fallback) {
+    char b[64];
+    if (!path || !*path || read_path_text(path, b, sizeof(b)) < 0) return fallback;
+    char *end = NULL;
+    errno = 0;
+    long v = strtol(b, &end, 10);
+    if (errno || end == b) return fallback;
+    return v;
 }
 
 static void find_hwmon(const Gpu *g, Sysfs *s) {
@@ -576,111 +676,135 @@ static void find_hwmon(const Gpu *g, Sysfs *s) {
         if (!path_join(base, sizeof(base), dirp, de->d_name)) continue;
         char p[MAX_PATH_LEN], txt[128];
 
-        if (!path_join(p, sizeof(p), base, "temp1_input")) continue;
-        if (path_exists(p)) {
-            snprintf(s->temp_path, sizeof(s->temp_path), "%s", p);
-            s->fd_temp = open(p, O_RDONLY | O_CLOEXEC);
+        s->temp_count = 0;
+        for (int ti = 1; ti <= MAX_GPU_TEMPS; ti++) {
+            char leaf[32];
+            snprintf(leaf, sizeof(leaf), "temp%d_input", ti);
+            if (!path_join(p, sizeof(p), base, leaf) || !path_exists(p)) continue;
+            int slot = ti - 1;
+            text_copy(s->temp_path[slot], sizeof(s->temp_path[slot]), p);
+            s->fd_temp[slot] = open(p, O_RDONLY | O_CLOEXEC);
+            if (s->fd_temp[slot] < 0) continue;
+            s->temp_count = ti;
+
+            snprintf(leaf, sizeof(leaf), "temp%d_label", ti);
+            if (path_join(p, sizeof(p), base, leaf) && read_path_text(p, txt, sizeof(txt)) >= 0 && txt[0])
+                text_copy(s->temp_label[slot], sizeof(s->temp_label[slot]), txt);
+            else
+                snprintf(s->temp_label[slot], sizeof(s->temp_label[slot]), "GPU temp %d", ti);
+
+            snprintf(leaf, sizeof(leaf), "temp%d_crit", ti);
+            if (path_join(p, sizeof(p), base, leaf)) s->temp_crit_mc[slot] = read_optional_long_path(p, -1);
+            snprintf(leaf, sizeof(leaf), "temp%d_emergency", ti);
+            if (path_join(p, sizeof(p), base, leaf)) s->temp_emergency_mc[slot] = read_optional_long_path(p, -1);
         }
-        if (!path_join(p, sizeof(p), base, "power1_average")) continue;
-        if (path_exists(p)) {
-            snprintf(s->power_path, sizeof(s->power_path), "%s", p);
+
+        if (path_join(p, sizeof(p), base, "power1_average") && path_exists(p)) {
+            text_copy(s->power_path, sizeof(s->power_path), p);
+            s->fd_power = open(p, O_RDONLY | O_CLOEXEC);
+        } else if (path_join(p, sizeof(p), base, "power1_input") && path_exists(p)) {
+            text_copy(s->power_path, sizeof(s->power_path), p);
             s->fd_power = open(p, O_RDONLY | O_CLOEXEC);
         }
-        if (!path_join(p, sizeof(p), base, "freq1_input")) continue;
-        if (path_exists(p)) {
-            snprintf(s->freq1_path, sizeof(s->freq1_path), "%s", p);
+
+        if (path_join(p, sizeof(p), base, "power1_cap") && path_exists(p)) {
+            text_copy(s->power_cap_path, sizeof(s->power_cap_path), p);
+            (void)open_rw_pair(p, &s->fd_power_cap_r, &s->fd_power_cap_w);
+        }
+        if (path_join(p, sizeof(p), base, "power1_cap_min") && path_exists(p)) {
+            text_copy(s->power_cap_min_path, sizeof(s->power_cap_min_path), p);
+            s->fd_power_cap_min = open(p, O_RDONLY | O_CLOEXEC);
+        }
+        if (path_join(p, sizeof(p), base, "power1_cap_max") && path_exists(p)) {
+            text_copy(s->power_cap_max_path, sizeof(s->power_cap_max_path), p);
+            s->fd_power_cap_max = open(p, O_RDONLY | O_CLOEXEC);
+        }
+
+        if (path_join(p, sizeof(p), base, "freq1_input") && path_exists(p)) {
+            text_copy(s->freq1_path, sizeof(s->freq1_path), p);
             s->fd_freq1 = open(p, O_RDONLY | O_CLOEXEC);
-            if (!path_join(p, sizeof(p), base, "freq1_label")) continue;
-            if (read_path_text(p, txt, sizeof(txt)) >= 0) text_copy(s->freq1_label, sizeof(s->freq1_label), txt);
+            if (path_join(p, sizeof(p), base, "freq1_label") && read_path_text(p, txt, sizeof(txt)) >= 0)
+                text_copy(s->freq1_label, sizeof(s->freq1_label), txt);
             else snprintf(s->freq1_label, sizeof(s->freq1_label), "freq1");
         }
-        if (!path_join(p, sizeof(p), base, "freq2_input")) continue;
-        if (path_exists(p)) {
-            snprintf(s->freq2_path, sizeof(s->freq2_path), "%s", p);
+        if (path_join(p, sizeof(p), base, "freq2_input") && path_exists(p)) {
+            text_copy(s->freq2_path, sizeof(s->freq2_path), p);
             s->fd_freq2 = open(p, O_RDONLY | O_CLOEXEC);
-            if (!path_join(p, sizeof(p), base, "freq2_label")) continue;
-            if (read_path_text(p, txt, sizeof(txt)) >= 0) text_copy(s->freq2_label, sizeof(s->freq2_label), txt);
+            if (path_join(p, sizeof(p), base, "freq2_label") && read_path_text(p, txt, sizeof(txt)) >= 0)
+                text_copy(s->freq2_label, sizeof(s->freq2_label), txt);
             else snprintf(s->freq2_label, sizeof(s->freq2_label), "freq2");
         }
 
-        if (!path_join(p, sizeof(p), base, "fan1_input")) continue;
-        if (path_exists(p)) {
-            snprintf(s->fan_rpm_path, sizeof(s->fan_rpm_path), "%s", p);
+        if (path_join(p, sizeof(p), base, "fan1_input") && path_exists(p)) {
+            text_copy(s->fan_rpm_path, sizeof(s->fan_rpm_path), p);
             s->fd_fan_rpm = open(p, O_RDONLY | O_CLOEXEC);
         }
-        if (!path_join(p, sizeof(p), base, "pwm1")) continue;
-        if (path_exists(p)) {
-            snprintf(s->pwm_path, sizeof(s->pwm_path), "%s", p);
+        if (path_join(p, sizeof(p), base, "pwm1") && path_exists(p)) {
+            text_copy(s->pwm_path, sizeof(s->pwm_path), p);
             s->fd_pwm = open(p, O_RDONLY | O_CLOEXEC);
         }
-        if (!path_join(p, sizeof(p), base, "pwm1_max")) continue;
-        if (path_exists(p)) {
-            snprintf(s->pwm_max_path, sizeof(s->pwm_max_path), "%s", p);
+        if (path_join(p, sizeof(p), base, "pwm1_max") && path_exists(p)) {
+            text_copy(s->pwm_max_path, sizeof(s->pwm_max_path), p);
             s->fd_pwm_max = open(p, O_RDONLY | O_CLOEXEC);
         }
 
-        /* AMD hwmon normally exposes the core rail as an in*_input voltage.
-           Prefer a labelled VDD/GFX rail when present, otherwise use in0_input. */
+        /* Prefer a labelled GPU core rail when one is exposed. */
         char fallback_voltage[MAX_PATH_LEN] = "";
         char fallback_label[32] = "voltage";
         for (int vi = 0; vi < 16; vi++) {
-            char inp[MAX_PATH_LEN], lab[MAX_PATH_LEN], lbl[64] = "";
-            char leaf[32]; snprintf(leaf, sizeof(leaf), "in%d_input", vi); if (!path_join(inp, sizeof(inp), base, leaf)) continue;
-            if (!path_exists(inp)) continue;
-            snprintf(leaf, sizeof(leaf), "in%d_label", vi); if (!path_join(lab, sizeof(lab), base, leaf)) continue;
-            read_path_text(lab, lbl, sizeof(lbl));
+            char inp[MAX_PATH_LEN], lab[MAX_PATH_LEN], lbl[64] = "", leaf[32];
+            snprintf(leaf, sizeof(leaf), "in%d_input", vi);
+            if (!path_join(inp, sizeof(inp), base, leaf) || !path_exists(inp)) continue;
+            snprintf(leaf, sizeof(leaf), "in%d_label", vi);
+            if (path_join(lab, sizeof(lab), base, leaf)) (void)read_path_text(lab, lbl, sizeof(lbl));
             if (!fallback_voltage[0]) {
-                snprintf(fallback_voltage, sizeof(fallback_voltage), "%s", inp);
-                if (lbl[0]) snprintf(fallback_label, sizeof(fallback_label), "%.31s", lbl);
+                text_copy(fallback_voltage, sizeof(fallback_voltage), inp);
+                if (lbl[0]) text_copy(fallback_label, sizeof(fallback_label), lbl);
             }
             char lower[64];
-            size_t ll = strlen(lbl);
-            if (ll >= sizeof(lower)) ll = sizeof(lower)-1;
-            for (size_t li=0; li<ll; li++) lower[li] = (char)tolower((unsigned char)lbl[li]);
+            size_t ll = strlen(lbl); if (ll >= sizeof(lower)) ll = sizeof(lower) - 1;
+            for (size_t li = 0; li < ll; li++) lower[li] = (char)tolower((unsigned char)lbl[li]);
             lower[ll] = 0;
-            if (strstr(lower,"vddgfx") || strstr(lower,"gfx") || strstr(lower,"vdd")) {
-                snprintf(s->voltage_path, sizeof(s->voltage_path), "%s", inp);
+            if (strstr(lower, "vddgfx") || strstr(lower, "gfx") || strstr(lower, "vdd")) {
+                text_copy(s->voltage_path, sizeof(s->voltage_path), inp);
                 text_copy(s->voltage_label, sizeof(s->voltage_label), lbl[0] ? lbl : "VDDGFX");
                 s->fd_voltage = open(inp, O_RDONLY | O_CLOEXEC);
                 break;
             }
         }
         if (s->fd_voltage < 0 && fallback_voltage[0]) {
-            snprintf(s->voltage_path, sizeof(s->voltage_path), "%s", fallback_voltage);
-            snprintf(s->voltage_label, sizeof(s->voltage_label), "%s", fallback_label);
+            text_copy(s->voltage_path, sizeof(s->voltage_path), fallback_voltage);
+            text_copy(s->voltage_label, sizeof(s->voltage_label), fallback_label);
             s->fd_voltage = open(fallback_voltage, O_RDONLY | O_CLOEXEC);
         }
 
-        /* hwmon current channels, when present, are reported in milliamperes.
-           Prefer a labelled GPU/board rail. If none exists, current is estimated
-           from board power and the nominal 12 V board input. */
+        /* Use real current when exposed; otherwise telemetry estimates board-side current. */
         char fallback_current[MAX_PATH_LEN] = "";
         char fallback_current_label[32] = "current";
         for (int ci = 1; ci <= 16; ci++) {
-            char inp[MAX_PATH_LEN], lab[MAX_PATH_LEN], lbl[64] = "";
-            char leaf[32];
+            char inp[MAX_PATH_LEN], lab[MAX_PATH_LEN], lbl[64] = "", leaf[32];
             snprintf(leaf, sizeof(leaf), "curr%d_input", ci);
             if (!path_join(inp, sizeof(inp), base, leaf) || !path_exists(inp)) continue;
             snprintf(leaf, sizeof(leaf), "curr%d_label", ci);
             if (path_join(lab, sizeof(lab), base, leaf)) (void)read_path_text(lab, lbl, sizeof(lbl));
             if (!fallback_current[0]) {
-                snprintf(fallback_current, sizeof(fallback_current), "%s", inp);
-                if (lbl[0]) snprintf(fallback_current_label, sizeof(fallback_current_label), "%.31s", lbl);
+                text_copy(fallback_current, sizeof(fallback_current), inp);
+                if (lbl[0]) text_copy(fallback_current_label, sizeof(fallback_current_label), lbl);
             }
             char lower[64];
             size_t ll = strlen(lbl); if (ll >= sizeof(lower)) ll = sizeof(lower) - 1;
             for (size_t li = 0; li < ll; li++) lower[li] = (char)tolower((unsigned char)lbl[li]);
             lower[ll] = 0;
             if (strstr(lower, "gpu") || strstr(lower, "gfx") || strstr(lower, "board") || strstr(lower, "total") || strstr(lower, "vdd")) {
-                snprintf(s->current_path, sizeof(s->current_path), "%s", inp);
+                text_copy(s->current_path, sizeof(s->current_path), inp);
                 text_copy(s->current_label, sizeof(s->current_label), lbl[0] ? lbl : "GPU current");
                 s->fd_current = open(inp, O_RDONLY | O_CLOEXEC);
                 break;
             }
         }
         if (s->fd_current < 0 && fallback_current[0]) {
-            snprintf(s->current_path, sizeof(s->current_path), "%s", fallback_current);
-            snprintf(s->current_label, sizeof(s->current_label), "%s", fallback_current_label);
+            text_copy(s->current_path, sizeof(s->current_path), fallback_current);
+            text_copy(s->current_label, sizeof(s->current_label), fallback_current_label);
             s->fd_current = open(fallback_current, O_RDONLY | O_CLOEXEC);
         }
         break;
@@ -720,9 +844,16 @@ static int sysfs_open(const Gpu *g, Sysfs *s) {
     memset(s, 0, sizeof(*s));
     s->fd_policy_r = s->fd_policy_w = s->fd_sclk_r = s->fd_sclk_w = -1;
     s->fd_mclk_r = s->fd_mclk_w = s->fd_busy = s->fd_mem_busy = -1;
-    s->fd_temp = s->fd_power = s->fd_freq1 = s->fd_freq2 = -1;
+    s->fd_power = s->fd_freq1 = s->fd_freq2 = -1;
     s->fd_fan_rpm = s->fd_pwm = s->fd_pwm_max = s->fd_voltage = s->fd_current = -1;
     s->fd_vram_used = s->fd_power_profile = s->fd_pcie_bw = -1;
+    s->fd_power_cap_r = s->fd_power_cap_w = s->fd_power_cap_min = s->fd_power_cap_max = -1;
+    s->fd_od_r = s->fd_od_w = -1;
+    for (int i = 0; i < MAX_GPU_TEMPS; i++) {
+        s->fd_temp[i] = -1;
+        s->temp_crit_mc[i] = -1;
+        s->temp_emergency_mc[i] = -1;
+    }
 
     if (!path_join(s->policy_path, sizeof(s->policy_path), g->base, "power_dpm_force_performance_level")) return -1;
     if (!path_join(s->sclk_path, sizeof(s->sclk_path), g->base, "pp_dpm_sclk")) return -1;
@@ -733,18 +864,20 @@ static int sysfs_open(const Gpu *g, Sysfs *s) {
     if (!path_join(s->power_profile_path, sizeof(s->power_profile_path), g->base, "pp_power_profile_mode")) return -1;
     if (!path_join(s->pcie_bw_path, sizeof(s->pcie_bw_path), g->base, "pcie_bw")) return -1;
     if (!path_join(s->gpu_metrics_path, sizeof(s->gpu_metrics_path), g->base, "gpu_metrics")) return -1;
+    if (!path_join(s->od_path, sizeof(s->od_path), g->base, "pp_od_clk_voltage")) return -1;
 
     if (open_rw_pair(s->policy_path, &s->fd_policy_r, &s->fd_policy_w) < 0) {
         sysfs_close(s);
         return -1;
     }
-    if (path_exists(s->sclk_path)) open_rw_pair(s->sclk_path, &s->fd_sclk_r, &s->fd_sclk_w);
-    if (path_exists(s->mclk_path)) open_rw_pair(s->mclk_path, &s->fd_mclk_r, &s->fd_mclk_w);
+    if (path_exists(s->sclk_path)) (void)open_rw_pair(s->sclk_path, &s->fd_sclk_r, &s->fd_sclk_w);
+    if (path_exists(s->mclk_path)) (void)open_rw_pair(s->mclk_path, &s->fd_mclk_r, &s->fd_mclk_w);
     if (path_exists(s->busy_path)) s->fd_busy = open(s->busy_path, O_RDONLY | O_CLOEXEC);
     if (path_exists(s->mem_busy_path)) s->fd_mem_busy = open(s->mem_busy_path, O_RDONLY | O_CLOEXEC);
     if (path_exists(s->vram_used_path)) s->fd_vram_used = open(s->vram_used_path, O_RDONLY | O_CLOEXEC);
     if (path_exists(s->power_profile_path)) s->fd_power_profile = open(s->power_profile_path, O_RDONLY | O_CLOEXEC);
     if (path_exists(s->pcie_bw_path)) s->fd_pcie_bw = open(s->pcie_bw_path, O_RDONLY | O_CLOEXEC);
+    if (path_exists(s->od_path)) (void)open_rw_pair(s->od_path, &s->fd_od_r, &s->fd_od_w);
     find_hwmon(g, s);
     find_debugfs(g, s);
     return 0;
@@ -1033,10 +1166,21 @@ static long read_long_fd(int fd, long fallback) {
 static void sample_power(Sysfs *s, PowerTelemetry *p) {
     p->gpu_busy = (int)read_long_fd(s->fd_busy, -1);
     p->mem_busy = (int)read_long_fd(s->fd_mem_busy, -1);
-    long tm = read_long_fd(s->fd_temp, -1);
+    p->temp_count = s->temp_count;
+    p->temp_c = -1.0;
+    for (int i = 0; i < MAX_GPU_TEMPS; i++) {
+        long tm = read_long_fd(s->fd_temp[i], -1);
+        p->temps_c[i] = tm >= 0 ? tm / 1000.0 : -1.0;
+        if (i == 0) p->temp_c = p->temps_c[i];
+    }
     long pw = read_long_fd(s->fd_power, -1);
-    p->temp_c = tm >= 0 ? tm / 1000.0 : -1.0;
     p->power_w = pw >= 0 ? pw / 1000000.0 : -1.0;
+    long cap = read_long_fd(s->fd_power_cap_r, -1);
+    long cap_min = read_long_fd(s->fd_power_cap_min, -1);
+    long cap_max = read_long_fd(s->fd_power_cap_max, -1);
+    p->power_cap_w = cap >= 0 ? cap / 1000000.0 : -1.0;
+    p->power_cap_min_w = cap_min >= 0 ? cap_min / 1000000.0 : -1.0;
+    p->power_cap_max_w = cap_max >= 0 ? cap_max / 1000000.0 : -1.0;
     long mv = read_long_fd(s->fd_voltage, -1);
     p->voltage_v = mv >= 0 ? mv / 1000.0 : -1.0;
     long ma = read_long_fd(s->fd_current, -1);
@@ -1106,6 +1250,65 @@ static void sample_power(Sysfs *s, PowerTelemetry *p) {
     } else p->gfxoff_status = -1;
 }
 
+static void discover_cpu_temp(SystemTelemetry *s) {
+    if (s->cpu_temp_discovered) return;
+    s->cpu_temp_discovered = true;
+    s->fd_cpu_temp = -1;
+    s->cpu_temp_crit_mc = -1;
+
+    DIR *d = opendir("/sys/class/hwmon");
+    if (!d) return;
+    char best_path[MAX_PATH_LEN] = "";
+    char best_label[32] = "";
+    char best_crit[MAX_PATH_LEN] = "";
+    int best_score = -1;
+    struct dirent *de;
+
+    while ((de = readdir(d))) {
+        if (strncmp(de->d_name, "hwmon", 5) != 0) continue;
+        char base[MAX_PATH_LEN], namep[MAX_PATH_LEN], name[64] = "";
+        if (!path_join(base, sizeof(base), "/sys/class/hwmon", de->d_name)) continue;
+        if (!path_join(namep, sizeof(namep), base, "name")) continue;
+        if (read_path_text(namep, name, sizeof(name)) < 0) continue;
+        int chip_score = strcasestr(name, "k10temp") ? 100 : 0;
+        if (!chip_score && !strcasestr(name, "zenpower")) continue;
+
+        for (int ti = 1; ti <= 16; ti++) {
+            char inp[MAX_PATH_LEN], labp[MAX_PATH_LEN], critp[MAX_PATH_LEN], label[64] = "", leaf[32];
+            snprintf(leaf, sizeof(leaf), "temp%d_input", ti);
+            if (!path_join(inp, sizeof(inp), base, leaf) || !path_exists(inp)) continue;
+            snprintf(leaf, sizeof(leaf), "temp%d_label", ti);
+            if (path_join(labp, sizeof(labp), base, leaf))
+                (void)read_path_text(labp, label, sizeof(label));
+
+            int score = chip_score;
+            if (strcasestr(label, "tdie")) score += 40;
+            else if (strcasestr(label, "tctl")) score += 30;
+            else if (strcasestr(label, "package")) score += 20;
+            else score += 5;
+
+            if (score > best_score) {
+                best_score = score;
+                text_copy(best_path, sizeof(best_path), inp);
+                text_copy(best_label, sizeof(best_label), label[0] ? label : name);
+                snprintf(leaf, sizeof(leaf), "temp%d_crit", ti);
+                if (path_join(critp, sizeof(critp), base, leaf) && path_exists(critp))
+                    text_copy(best_crit, sizeof(best_crit), critp);
+                else
+                    best_crit[0] = '\0';
+            }
+        }
+    }
+    closedir(d);
+
+    if (best_path[0]) {
+        text_copy(s->cpu_temp_path, sizeof(s->cpu_temp_path), best_path);
+        text_copy(s->cpu_temp_label, sizeof(s->cpu_temp_label), best_label[0] ? best_label : "CPU");
+        s->fd_cpu_temp = open(best_path, O_RDONLY | O_CLOEXEC);
+        if (best_crit[0]) s->cpu_temp_crit_mc = read_optional_long_path(best_crit, -1);
+    }
+}
+
 static void sample_system(SystemTelemetry *s) {
     FILE *f = fopen("/proc/stat", "r");
     if (f) {
@@ -1148,6 +1351,382 @@ static void sample_system(SystemTelemetry *s) {
     }
     long threads = sysconf(_SC_NPROCESSORS_ONLN);
     s->cpu_threads = threads > 0 ? (unsigned)threads : 0U;
+
+    discover_cpu_temp(s);
+    long cpu_mc = read_long_fd(s->fd_cpu_temp, -1);
+    s->cpu_temp_c = cpu_mc >= 0 ? cpu_mc / 1000.0 : -1.0;
+}
+
+
+static int extract_longs(const char *text, long *values, int max_values) {
+    int n = 0;
+    const char *p = text;
+    while (p && *p && n < max_values) {
+        while (*p && !isdigit((unsigned char)*p) && *p != '-' && *p != '+') p++;
+        if (!*p) break;
+        errno = 0;
+        char *end = NULL;
+        long v = strtol(p, &end, 10);
+        if (end == p) { p++; continue; }
+        if (!errno) values[n++] = v;
+        p = end;
+    }
+    return n;
+}
+
+static long clamp_long_value(long v, long lo, long hi) {
+    if (lo <= hi) {
+        if (v < lo) return lo;
+        if (v > hi) return hi;
+    }
+    return v;
+}
+
+static double clamp_double_value(double v, double lo, double hi) {
+    if (lo <= hi) {
+        if (v < lo) return lo;
+        if (v > hi) return hi;
+    }
+    return v;
+}
+
+static void tuning_refresh(Sysfs *s, TuningState *t, bool capture_defaults) {
+    bool was_initialized = t->initialized;
+    const GpuSpec *spec = t->spec;
+    bool armed = t->armed;
+
+    long old_def_smin = t->default_sclk_min_mhz;
+    long old_def_smax = t->default_sclk_max_mhz;
+    long old_def_soff = t->default_sclk_offset_mhz;
+    long old_def_mmax = t->default_mclk_max_mhz;
+    long old_def_voff = t->default_vdd_offset_mv;
+    double old_def_pcap = t->default_power_cap_w;
+
+    memset(t, 0, sizeof(*t));
+    t->spec = spec;
+    t->armed = armed;
+    t->sclk_min_mhz = t->sclk_max_mhz = -1;
+    t->sclk_limit_min_mhz = t->sclk_limit_max_mhz = -1;
+    t->sclk_offset_mhz = t->sclk_offset_min_mhz = t->sclk_offset_max_mhz = 0;
+    t->mclk_min_mhz = t->mclk_max_mhz = -1;
+    t->mclk_limit_min_mhz = t->mclk_limit_max_mhz = -1;
+    t->vdd_offset_mv = t->vdd_offset_min_mv = t->vdd_offset_max_mv = 0;
+    t->power_cap_w = t->power_cap_min_w = t->power_cap_max_w = -1.0;
+
+    int sclk_count = 0, mclk_count = 0;
+    long sclk_values[16] = {0}, mclk_values[16] = {0};
+    bool in_sclk = false, in_mclk = false, in_soff = false, in_voff = false, in_range = false;
+
+    if (s->fd_od_r >= 0) {
+        char buf[MAX_TEXT];
+        if (read_fd_text(s->fd_od_r, buf, sizeof(buf)) >= 0) {
+            char *save = NULL;
+            for (char *line = strtok_r(buf, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+                trim(line);
+                if (!*line) continue;
+                if (strcmp(line, "OD_SCLK:") == 0) {
+                    in_sclk = true; in_mclk = in_soff = in_voff = in_range = false; continue;
+                }
+                if (strcmp(line, "OD_MCLK:") == 0) {
+                    in_mclk = true; in_sclk = in_soff = in_voff = in_range = false; continue;
+                }
+                if (strcmp(line, "OD_SCLK_OFFSET:") == 0) {
+                    in_soff = true; in_sclk = in_mclk = in_voff = in_range = false; continue;
+                }
+                if (strcmp(line, "OD_VDDGFX_OFFSET:") == 0) {
+                    in_voff = true; in_sclk = in_mclk = in_soff = in_range = false; continue;
+                }
+                if (strcmp(line, "OD_RANGE:") == 0) {
+                    in_range = true; in_sclk = in_mclk = in_soff = in_voff = false; continue;
+                }
+                if (strncmp(line, "OD_", 3) == 0) {
+                    in_sclk = in_mclk = in_soff = in_voff = in_range = false; continue;
+                }
+
+                long v[8] = {0};
+                int n = extract_longs(line, v, 8);
+                if (in_range) {
+                    if (strncasecmp(line, "SCLK_OFFSET", 11) == 0 && n >= 2) {
+                        t->sclk_offset_min_mhz = v[0];
+                        t->sclk_offset_max_mhz = v[1];
+                        t->has_sclk_offset = true;
+                    } else if (strncasecmp(line, "SCLK", 4) == 0 && n >= 2) {
+                        t->sclk_limit_min_mhz = v[0];
+                        t->sclk_limit_max_mhz = v[1];
+                    } else if (strncasecmp(line, "MCLK", 4) == 0 && n >= 2) {
+                        t->mclk_limit_min_mhz = v[0];
+                        t->mclk_limit_max_mhz = v[1];
+                    } else if ((strncasecmp(line, "VDDGFX_OFFSET", 13) == 0 ||
+                                strncasecmp(line, "VDDC_OFFSET", 11) == 0) && n >= 2) {
+                        t->vdd_offset_min_mv = v[0];
+                        t->vdd_offset_max_mv = v[1];
+                        t->has_vdd_offset = true;
+                    }
+                } else if (in_sclk && n >= 2) {
+                    if (sclk_count < (int)(sizeof(sclk_values)/sizeof(sclk_values[0])))
+                        sclk_values[sclk_count++] = v[1];
+                } else if (in_mclk && n >= 2) {
+                    if (mclk_count < (int)(sizeof(mclk_values)/sizeof(mclk_values[0])))
+                        mclk_values[mclk_count++] = v[1];
+                } else if (in_soff && n >= 1) {
+                    t->sclk_offset_mhz = v[n - 1];
+                    t->has_sclk_offset = true;
+                    if (strchr(line, ':')) t->sclk_offset_legacy = true;
+                } else if (in_voff && n >= 1) {
+                    t->vdd_offset_mv = v[n - 1];
+                    t->has_vdd_offset = true;
+                }
+            }
+        }
+    }
+
+    /* Vega20+ / RDNA min-max form has exactly two editable clock endpoints.
+       Older multi-state voltage tables are deliberately left read-only here. */
+    if (sclk_count == 2 && t->sclk_limit_min_mhz >= 0 && t->sclk_limit_max_mhz >= 0) {
+        t->has_sclk = true;
+        t->sclk_min_mhz = sclk_values[0];
+        t->sclk_max_mhz = sclk_values[1];
+    } else if (sclk_count == 1 && t->sclk_limit_min_mhz >= 0 && t->sclk_limit_max_mhz >= 0) {
+        /* Navi/RDNA1 commonly exposes only editable state 1 (maximum). */
+        t->has_sclk = true;
+        t->sclk_max_only = true;
+        t->sclk_min_mhz = -1;
+        t->sclk_max_mhz = sclk_values[0];
+    }
+    if (mclk_count == 2 && t->mclk_limit_min_mhz >= 0 && t->mclk_limit_max_mhz >= 0) {
+        t->has_mclk = true;
+        t->mclk_min_mhz = mclk_values[0];
+        t->mclk_max_mhz = mclk_values[1];
+    } else if (mclk_count == 1 && t->mclk_limit_min_mhz >= 0 && t->mclk_limit_max_mhz >= 0) {
+        t->has_mclk = true;
+        t->mclk_max_only = true;
+        t->mclk_min_mhz = -1;
+        t->mclk_max_mhz = mclk_values[0];
+    }
+
+    long pcap = read_long_fd(s->fd_power_cap_r, -1);
+    long pmin = read_long_fd(s->fd_power_cap_min, -1);
+    long pmax = read_long_fd(s->fd_power_cap_max, -1);
+    if (pcap >= 0) {
+        t->has_power_cap = true;
+        t->power_cap_w = pcap / 1000000.0;
+        t->power_cap_min_w = pmin >= 0 ? pmin / 1000000.0 : t->power_cap_w;
+        t->power_cap_max_w = pmax >= 0 ? pmax / 1000000.0 : t->power_cap_w;
+    }
+
+    t->available = t->has_sclk || t->has_sclk_offset || t->has_mclk ||
+                   t->has_vdd_offset || t->has_power_cap;
+
+    if (!was_initialized || capture_defaults) {
+        t->default_sclk_min_mhz = t->sclk_min_mhz;
+        t->default_sclk_max_mhz = t->sclk_max_mhz;
+        t->default_sclk_offset_mhz = t->sclk_offset_mhz;
+        t->default_mclk_min_mhz = t->mclk_min_mhz;
+        t->default_mclk_max_mhz = t->mclk_max_mhz;
+        t->default_vdd_offset_mv = t->vdd_offset_mv;
+        t->default_power_cap_w = t->power_cap_w;
+
+        t->edit_sclk_min_mhz = t->sclk_min_mhz;
+        t->edit_sclk_max_mhz = t->sclk_max_mhz;
+        t->edit_sclk_offset_mhz = t->sclk_offset_mhz;
+        t->edit_mclk_max_mhz = t->mclk_max_mhz;
+        t->edit_vdd_offset_mv = t->vdd_offset_mv;
+        t->edit_power_cap_w = t->power_cap_w;
+    } else {
+        t->default_sclk_min_mhz = old_def_smin;
+        t->default_sclk_max_mhz = old_def_smax;
+        t->default_sclk_offset_mhz = old_def_soff;
+        t->default_mclk_max_mhz = old_def_mmax;
+        t->default_vdd_offset_mv = old_def_voff;
+        t->default_power_cap_w = old_def_pcap;
+
+        /* After a successful apply, edits follow the now-current values. */
+        t->edit_sclk_min_mhz = t->sclk_min_mhz;
+        t->edit_sclk_max_mhz = t->sclk_max_mhz;
+        t->edit_sclk_offset_mhz = t->sclk_offset_mhz;
+        t->edit_mclk_max_mhz = t->mclk_max_mhz;
+        t->edit_vdd_offset_mv = t->vdd_offset_mv;
+        t->edit_power_cap_w = t->power_cap_w;
+    }
+    t->initialized = true;
+}
+
+static TuneZone tuning_zone_long(long value, long baseline, long limit_max) {
+    if (value < 0 || baseline < 0) return TUNE_ZONE_UNAVAILABLE;
+    if (value <= baseline || limit_max <= baseline) return TUNE_ZONE_SAFE;
+    double f = (double)(value - baseline) / (double)(limit_max - baseline);
+    return f >= 0.75 ? TUNE_ZONE_DANGER : TUNE_ZONE_WARNING;
+}
+
+static TuneZone tuning_zone_double(double value, double baseline, double limit_max) {
+    if (value < 0.0 || baseline < 0.0) return TUNE_ZONE_UNAVAILABLE;
+    if (value <= baseline || limit_max <= baseline) return TUNE_ZONE_SAFE;
+    double f = (value - baseline) / (limit_max - baseline);
+    return f >= 0.75 ? TUNE_ZONE_DANGER : TUNE_ZONE_WARNING;
+}
+
+static TuneZone tuning_zone_offset(long value, long max_positive) {
+    if (max_positive <= 0 || value <= 0) return TUNE_ZONE_SAFE;
+    return value >= (long)llround((double)max_positive * 0.75) ?
+        TUNE_ZONE_DANGER : TUNE_ZONE_WARNING;
+}
+
+static int write_power_cap(Sysfs *s, double watts) {
+    if (s->fd_power_cap_w < 0) { errno = ENOTSUP; return -1; }
+    long long uw = llround(watts * 1000000.0);
+    char b[64];
+    snprintf(b, sizeof(b), "%lld", uw);
+    return write_fd_text(s->fd_power_cap_w, b);
+}
+
+static int tuning_apply(Sysfs *s, Target *target, TuningState *t,
+                        char *message, size_t cap) {
+    if (!t->armed) {
+        snprintf(message, cap, "Tuning writes are disarmed. Click ARM first.");
+        return -1;
+    }
+    if (!t->available) {
+        snprintf(message, cap, "No firmware-exposed tuning controls are available.");
+        return -1;
+    }
+
+    bool od_changed = false;
+    char cmd[96];
+    snprintf(target->policy, sizeof(target->policy), "manual");
+    if (apply_policy(s, "manual") < 0) {
+        snprintf(message, cap, "Cannot enter manual power mode: %s", strerror(errno));
+        return -1;
+    }
+
+    if (s->fd_od_w >= 0) {
+        if (t->has_sclk) {
+            t->edit_sclk_max_mhz = clamp_long_value(t->edit_sclk_max_mhz,
+                                                     t->sclk_limit_min_mhz,
+                                                     t->sclk_limit_max_mhz);
+            if (!t->sclk_max_only) {
+                t->edit_sclk_min_mhz = clamp_long_value(t->edit_sclk_min_mhz,
+                                                         t->sclk_limit_min_mhz,
+                                                         t->sclk_limit_max_mhz);
+                if (t->edit_sclk_min_mhz > t->edit_sclk_max_mhz)
+                    t->edit_sclk_min_mhz = t->edit_sclk_max_mhz;
+                snprintf(cmd, sizeof(cmd), "s 0 %ld", t->edit_sclk_min_mhz);
+                if (write_fd_text(s->fd_od_w, cmd) < 0) goto od_fail;
+            }
+            snprintf(cmd, sizeof(cmd), "s 1 %ld", t->edit_sclk_max_mhz);
+            if (write_fd_text(s->fd_od_w, cmd) < 0) goto od_fail;
+            od_changed = true;
+        } else if (t->has_sclk_offset) {
+            t->edit_sclk_offset_mhz = clamp_long_value(t->edit_sclk_offset_mhz,
+                                                        t->sclk_offset_min_mhz,
+                                                        t->sclk_offset_max_mhz);
+            if (t->sclk_offset_legacy)
+                snprintf(cmd, sizeof(cmd), "s 1 %ld", t->edit_sclk_offset_mhz);
+            else
+                snprintf(cmd, sizeof(cmd), "s %ld", t->edit_sclk_offset_mhz);
+            if (write_fd_text(s->fd_od_w, cmd) < 0) goto od_fail;
+            od_changed = true;
+        }
+
+        if (t->has_mclk) {
+            t->edit_mclk_max_mhz = clamp_long_value(t->edit_mclk_max_mhz,
+                                                     t->mclk_limit_min_mhz,
+                                                     t->mclk_limit_max_mhz);
+            snprintf(cmd, sizeof(cmd), "m 1 %ld", t->edit_mclk_max_mhz);
+            if (write_fd_text(s->fd_od_w, cmd) < 0) goto od_fail;
+            od_changed = true;
+        }
+
+        if (t->has_vdd_offset) {
+            t->edit_vdd_offset_mv = clamp_long_value(t->edit_vdd_offset_mv,
+                                                      t->vdd_offset_min_mv,
+                                                      t->vdd_offset_max_mv);
+            snprintf(cmd, sizeof(cmd), "vo %ld", t->edit_vdd_offset_mv);
+            if (write_fd_text(s->fd_od_w, cmd) < 0) goto od_fail;
+            od_changed = true;
+        }
+
+        if (od_changed && write_fd_text(s->fd_od_w, "c") < 0) goto od_fail;
+    }
+
+    if (t->has_power_cap) {
+        t->edit_power_cap_w = clamp_double_value(t->edit_power_cap_w,
+                                                  t->power_cap_min_w,
+                                                  t->power_cap_max_w);
+        if (write_power_cap(s, t->edit_power_cap_w) < 0) {
+            snprintf(message, cap, "Clock settings applied, but power-cap write failed: %s", strerror(errno));
+            t->armed = false;
+            tuning_refresh(s, t, false);
+            return -1;
+        }
+    }
+
+    t->armed = false;
+    tuning_refresh(s, t, false);
+    snprintf(message, cap, "Tuning applied within driver/firmware limits. Writes disarmed.");
+    return 0;
+
+od_fail:
+    {
+        int saved = errno;
+        (void)write_fd_text(s->fd_od_w, "r");
+        errno = saved;
+        snprintf(message, cap, "Overdrive write rejected by driver: %s", strerror(errno));
+        t->armed = false;
+        tuning_refresh(s, t, false);
+        return -1;
+    }
+}
+
+static int tuning_reset(Sysfs *s, Target *target, TuningState *t,
+                        char *message, size_t cap) {
+    int rc = 0;
+    if (s->fd_od_w >= 0) {
+        if (write_fd_text(s->fd_od_w, "r") < 0) rc = -1;
+    }
+    if (t->has_power_cap && t->default_power_cap_w > 0.0) {
+        if (write_power_cap(s, t->default_power_cap_w) < 0) rc = -1;
+    }
+    snprintf(target->policy, sizeof(target->policy), "profile_standard");
+    target->lock_sclk = false;
+    target->lock_mclk = false;
+    if (apply_policy(s, target->policy) < 0) rc = -1;
+    t->armed = false;
+    tuning_refresh(s, t, true);
+    snprintf(message, cap, rc == 0 ?
+             "Tuning reset to driver defaults / captured stock power cap." :
+             "Reset attempted; one or more driver writes were rejected.");
+    return rc;
+}
+
+static void tuning_adjust(TuningState *t, int row, int direction) {
+    long sign = direction < 0 ? -1L : 1L;
+    switch (row) {
+        case 0:
+            if (t->has_sclk)
+                t->edit_sclk_max_mhz = clamp_long_value(t->edit_sclk_max_mhz + sign * 25L,
+                                                         t->sclk_limit_min_mhz, t->sclk_limit_max_mhz);
+            else if (t->has_sclk_offset)
+                t->edit_sclk_offset_mhz = clamp_long_value(t->edit_sclk_offset_mhz + sign * 10L,
+                                                            t->sclk_offset_min_mhz, t->sclk_offset_max_mhz);
+            break;
+        case 1:
+            if (t->has_mclk)
+                t->edit_mclk_max_mhz = clamp_long_value(t->edit_mclk_max_mhz + sign * 25L,
+                                                         t->mclk_limit_min_mhz, t->mclk_limit_max_mhz);
+            break;
+        case 2:
+            if (t->has_vdd_offset)
+                t->edit_vdd_offset_mv = clamp_long_value(t->edit_vdd_offset_mv + sign * 10L,
+                                                          t->vdd_offset_min_mv, t->vdd_offset_max_mv);
+            break;
+        case 3:
+            if (t->has_power_cap)
+                t->edit_power_cap_w = clamp_double_value(t->edit_power_cap_w + direction * 5.0,
+                                                          t->power_cap_min_w, t->power_cap_max_w);
+            break;
+        default:
+            break;
+    }
 }
 
 static const char *gfxoff_text(int status) {
@@ -1831,6 +2410,36 @@ static void gui_bar(Gui *ui, Rect r, double pct, const char *label) {
     if (label && *label) gui_text(ui, r.x + 6, r.y + r.h - 6, ui->fg, true, "%s", label);
 }
 
+static void gui_bar_color(Gui *ui, Rect r, double pct, const char *label,
+                          unsigned long fill_color) {
+    if (pct < 0.0) pct = 0.0;
+    if (pct > 100.0) pct = 100.0;
+    gui_fill(ui, r, ui->panel_alt);
+    Rect fill = r;
+    fill.w = (int)((double)r.w * pct / 100.0);
+    gui_fill(ui, fill, fill_color);
+    gui_outline(ui, r, ui->dim);
+    if (label && *label) gui_text(ui, r.x + 6, r.y + r.h - 6, ui->fg, true, "%s", label);
+}
+
+static unsigned long tune_zone_color(Gui *ui, TuneZone zone) {
+    switch (zone) {
+        case TUNE_ZONE_SAFE: return ui->good;
+        case TUNE_ZONE_WARNING: return ui->warn;
+        case TUNE_ZONE_DANGER: return ui->bad;
+        case TUNE_ZONE_UNAVAILABLE: default: return ui->dim;
+    }
+}
+
+static TuneZone temperature_zone(double c, long crit_mc, long emergency_mc) {
+    if (c < 0.0) return TUNE_ZONE_UNAVAILABLE;
+    double crit = crit_mc > 0 ? crit_mc / 1000.0 : 90.0;
+    double emergency = emergency_mc > 0 ? emergency_mc / 1000.0 : fmax(crit + 10.0, 105.0);
+    if (c >= emergency || c >= 100.0) return TUNE_ZONE_DANGER;
+    if (c >= crit || c >= 85.0) return TUNE_ZONE_WARNING;
+    return TUNE_ZONE_SAFE;
+}
+
 static bool point_in(Rect r, int x, int y) {
     return x >= r.x && y >= r.y && x < r.x + r.w && y < r.y + r.h;
 }
@@ -1946,7 +2555,7 @@ static int gui_init(Gui *ui, SessionInfo *si) {
     ui->screen = DefaultScreen(ui->dpy);
     ui->root = RootWindow(ui->dpy, ui->screen);
     ui->width = 1100;
-    ui->height = 910;
+    ui->height = 980;
     ui->bg = gui_color(ui, "#101214", BlackPixel(ui->dpy, ui->screen));
     ui->panel = gui_color(ui, "#1a1d21", ui->bg);
     ui->panel_alt = gui_color(ui, "#262a2f", ui->panel);
@@ -1966,7 +2575,7 @@ static int gui_init(Gui *ui, SessionInfo *si) {
     XSizeHints hints = {0};
     hints.flags = PMinSize;
     hints.min_width = 960;
-    hints.min_height = 820;
+    hints.min_height = 900;
     XSetWMNormalHints(ui->dpy, ui->win, &hints);
 
     ui->gc = XCreateGC(ui->dpy, ui->win, 0, NULL);
@@ -1993,12 +2602,12 @@ static void gui_close(Gui *ui) {
 }
 
 static const char *view_name(View v) {
-    static const char *names[] = {"Home", "Clients", "Power", "Desktop", "Events", "Trace", "Help", "About"};
+    static const char *names[] = {"Home", "Clients", "Power", "Tuning", "Desktop", "Events", "Trace", "Help", "About"};
     return (v >= VIEW_DASHBOARD && v <= VIEW_ABOUT) ? names[v] : "Home";
 }
 
 static Rect tab_rect(const Gui *ui, int idx) {
-    int count = 8, gap = 4, x0 = 12, y = 300, h = 30;
+    int count = 9, gap = 4, x0 = 12, y = 335, h = 30;
     int w = (ui->width - x0 * 2 - gap * (count - 1)) / count;
     return (Rect){x0 + idx * (w + gap), y, w, h};
 }
@@ -2011,6 +2620,20 @@ static Rect control_rect(const Gui *ui, int idx) {
 
 static Rect mode_rect(const Gui *ui, int idx) {
     int count = 8, gap = 3, x0 = 12, y = 78, h = 29;
+    int w = (ui->width - x0 * 2 - gap * (count - 1)) / count;
+    return (Rect){x0 + idx * (w + gap), y, w, h};
+}
+
+static Rect tuning_minus_rect(const Gui *ui, int row) {
+    return (Rect){ui->width - 190, 520 + row * 68, 72, 30};
+}
+
+static Rect tuning_plus_rect(const Gui *ui, int row) {
+    return (Rect){ui->width - 105, 520 + row * 68, 72, 30};
+}
+
+static Rect tuning_action_rect(const Gui *ui, int idx) {
+    int count = 4, gap = 8, x0 = 20, y = 805, h = 34;
     int w = (ui->width - x0 * 2 - gap * (count - 1)) / count;
     return (Rect){x0 + idx * (w + gap), y, w, h};
 }
@@ -2047,95 +2670,107 @@ static void draw_header(Gui *ui, const Gpu *g, Sysfs *s, const Target *t,
         draw_button(ui, mode_rect(ui, i), modes[i], strcmp(t->policy, POLICIES[i]) == 0);
 
     char label[192];
-
-    /*
-     * Board power is intentionally the dominant live meter.  Power changes are
-     * the primary signal this tool is intended to correlate with rendering and
-     * AMDGPU policy activity.
-     */
-    Rect power_bar = {16, 119, ui->width - 32, 38};
-    double power_pct = p->power_w >= 0.0 ? p->power_w * 100.0 / POWER_BAR_MAX_W : 0.0;
-    if (p->power_w >= 0.0)
-        snprintf(label, sizeof(label), "BOARD POWER   %.1f W   (%.0f W scale)",
-                 p->power_w, POWER_BAR_MAX_W);
+    double power_scale = p->power_cap_max_w > 1.0 ? p->power_cap_max_w : POWER_BAR_MAX_W;
+    if (power_scale < 100.0) power_scale = POWER_BAR_MAX_W;
+    Rect power_bar = {16, 119, ui->width - 32, 42};
+    double power_pct = p->power_w >= 0.0 ? p->power_w * 100.0 / power_scale : 0.0;
+    if (p->power_w >= 0.0 && p->power_cap_w > 0.0)
+        snprintf(label, sizeof(label), "BOARD POWER   %.1f W    POWER CAP %.0f W    firmware scale %.0f W",
+                 p->power_w, p->power_cap_w, power_scale);
+    else if (p->power_w >= 0.0)
+        snprintf(label, sizeof(label), "BOARD POWER   %.1f W    scale %.0f W", p->power_w, power_scale);
     else
         snprintf(label, sizeof(label), "BOARD POWER   unavailable");
-    gui_bar(ui, power_bar, power_pct, label);
+    gui_bar_color(ui, power_bar, power_pct, label,
+                  power_pct >= 95.0 ? ui->bad : power_pct >= 80.0 ? ui->warn : ui->accent);
 
-    const int gap = 8;
-    const int margin = 16;
-    int half = (ui->width - margin * 2 - gap) / 2;
-    Rect left = {margin, 167, half, 22};
-    Rect right = {margin + half + gap, 167, half, 22};
+    /* Temperatures are deliberately prominent and always visible. */
+    double temp_values[MAX_GPU_TEMPS + 1];
+    long temp_crit[MAX_GPU_TEMPS + 1];
+    long temp_emergency[MAX_GPU_TEMPS + 1];
+    const char *temp_names[MAX_GPU_TEMPS + 1];
+    int nt = 0;
+    for (int i = 0; i < MAX_GPU_TEMPS; i++) {
+        if (p->temps_c[i] < 0.0) continue;
+        temp_values[nt] = p->temps_c[i];
+        temp_crit[nt] = s->temp_crit_mc[i];
+        temp_emergency[nt] = s->temp_emergency_mc[i];
+        temp_names[nt] = s->temp_label[i][0] ? s->temp_label[i] : "GPU";
+        nt++;
+    }
+    if (sys->cpu_temp_c >= 0.0 && nt < MAX_GPU_TEMPS + 1) {
+        temp_values[nt] = sys->cpu_temp_c;
+        temp_crit[nt] = sys->cpu_temp_crit_mc;
+        temp_emergency[nt] = -1;
+        temp_names[nt] = sys->cpu_temp_label[0] ? sys->cpu_temp_label : "CPU";
+        nt++;
+    }
+
+    int margin = 16, gap = 7;
+    if (nt > 0) {
+        int tw = (ui->width - margin * 2 - gap * (nt - 1)) / nt;
+        for (int i = 0; i < nt; i++) {
+            double max_c = temp_emergency[i] > 0 ? temp_emergency[i] / 1000.0 :
+                           temp_crit[i] > 0 ? temp_crit[i] / 1000.0 + 10.0 : 110.0;
+            if (max_c < 80.0) max_c = 110.0;
+            snprintf(label, sizeof(label), "%s   %.1f C", temp_names[i], temp_values[i]);
+            TuneZone z = temperature_zone(temp_values[i], temp_crit[i], temp_emergency[i]);
+            gui_bar_color(ui, (Rect){margin + i * (tw + gap), 170, tw, 31},
+                          temp_values[i] * 100.0 / max_c, label, tune_zone_color(ui, z));
+        }
+    } else {
+        gui_bar_color(ui, (Rect){margin, 170, ui->width - margin * 2, 31}, 0.0,
+                      "Temperatures unavailable", ui->dim);
+    }
+
+    const int half_gap = 8;
+    int half = (ui->width - margin * 2 - half_gap) / 2;
+    Rect left = {margin, 211, half, 22};
+    Rect right = {margin + half + half_gap, 211, half, 22};
 
     snprintf(label, sizeof(label), "GPU load %d%%", p->gpu_busy >= 0 ? p->gpu_busy : 0);
     gui_bar(ui, left, p->gpu_busy >= 0 ? p->gpu_busy : 0.0, label);
-
-    double vram_pct = g->vram_bytes ?
-        (double)p->vram_used * 100.0 / (double)g->vram_bytes : 0.0;
+    double vram_pct = g->vram_bytes ? (double)p->vram_used * 100.0 / (double)g->vram_bytes : 0.0;
     snprintf(label, sizeof(label), "VRAM %.2f / %.2f GiB (%.1f%%)",
-             p->vram_used / 1073741824.0,
-             g->vram_bytes / 1073741824.0,
-             vram_pct);
+             p->vram_used / 1073741824.0, g->vram_bytes / 1073741824.0, vram_pct);
     gui_bar(ui, right, vram_pct, label);
 
-    left.y = right.y = 195;
-    snprintf(label, sizeof(label), "CPU %.1f%%  (%u threads)",
-             sys->cpu_pct, sys->cpu_threads);
+    left.y = right.y = 239;
+    snprintf(label, sizeof(label), "CPU %.1f%%  (%u threads)", sys->cpu_pct, sys->cpu_threads);
     gui_bar(ui, left, sys->cpu_pct, label);
-
     snprintf(label, sizeof(label), "System RAM %.2f / %.2f GiB (%.1f%%)",
-             sys->ram_used_bytes / 1073741824.0,
-             sys->ram_total_bytes / 1073741824.0,
-             sys->ram_pct);
+             sys->ram_used_bytes / 1073741824.0, sys->ram_total_bytes / 1073741824.0, sys->ram_pct);
     gui_bar(ui, right, sys->ram_pct, label);
 
-    left.y = right.y = 223;
-    double voltage_pct = p->voltage_v >= 0.0 ?
-        p->voltage_v * 100.0 / VOLTAGE_BAR_MAX_V : 0.0;
+    left.y = right.y = 267;
+    double voltage_pct = p->voltage_v >= 0.0 ? p->voltage_v * 100.0 / VOLTAGE_BAR_MAX_V : 0.0;
     if (p->voltage_v >= 0.0)
         snprintf(label, sizeof(label), "%s %.3f V",
-                 s->voltage_label[0] ? s->voltage_label : "GPU voltage",
-                 p->voltage_v);
+                 s->voltage_label[0] ? s->voltage_label : "GPU voltage", p->voltage_v);
     else
         snprintf(label, sizeof(label), "GPU voltage unavailable");
     gui_bar(ui, left, voltage_pct, label);
 
-    double current_pct = p->current_a >= 0.0 ?
-        p->current_a * 100.0 / CURRENT_BAR_MAX_A : 0.0;
+    double current_pct = p->current_a >= 0.0 ? p->current_a * 100.0 / CURRENT_BAR_MAX_A : 0.0;
     if (p->current_a >= 0.0)
-        snprintf(label, sizeof(label), "Current %s %.2f A%s",
-                 p->current_label, p->current_a,
+        snprintf(label, sizeof(label), "Current %s %.2f A%s", p->current_label, p->current_a,
                  p->current_is_estimate ? " (est.)" : "");
     else
         snprintf(label, sizeof(label), "Current unavailable");
     gui_bar(ui, right, current_pct, label);
 
     char fan[80], gfx[80], mem[80];
-    if (p->fan_rpm >= 0 && p->fan_pct >= 0)
-        snprintf(fan, sizeof(fan), "%d RPM / %.0f%%", p->fan_rpm, p->fan_pct);
-    else if (p->fan_rpm >= 0)
-        snprintf(fan, sizeof(fan), "%d RPM", p->fan_rpm);
-    else
-        snprintf(fan, sizeof(fan), "n/a");
-
-    if (p->gfx_hz >= 0)
-        snprintf(gfx, sizeof(gfx), "%.0f MHz", p->gfx_hz / 1000000.0);
-    else
-        snprintf(gfx, sizeof(gfx), "n/a");
-
-    if (p->mem_hz >= 0)
-        snprintf(mem, sizeof(mem), "%.0f MHz", p->mem_hz / 1000000.0);
-    else
-        snprintf(mem, sizeof(mem), "n/a");
-
-    gui_text(ui, 16, 272, ui->fg, false,
-             "Temp %.1f C   Fan %s   Board %.1f W   GFX %s   MEM %s   watchdog %.0f Hz",
-             p->temp_c, fan, p->power_w, gfx, mem, st->loop_hz);
+    if (p->fan_rpm >= 0 && p->fan_pct >= 0) snprintf(fan, sizeof(fan), "%d RPM / %.0f%%", p->fan_rpm, p->fan_pct);
+    else if (p->fan_rpm >= 0) snprintf(fan, sizeof(fan), "%d RPM", p->fan_rpm);
+    else snprintf(fan, sizeof(fan), "n/a");
+    if (p->gfx_hz >= 0) snprintf(gfx, sizeof(gfx), "%.0f MHz", p->gfx_hz / 1000000.0); else snprintf(gfx, sizeof(gfx), "n/a");
+    if (p->mem_hz >= 0) snprintf(mem, sizeof(mem), "%.0f MHz", p->mem_hz / 1000000.0); else snprintf(mem, sizeof(mem), "n/a");
+    gui_text(ui, 16, 314, ui->fg, false,
+             "Fan %s   GFX %s   MEM %s   watchdog %.0f Hz", fan, gfx, mem, st->loop_hz);
 }
 
 static void draw_tabs(Gui *ui, View view) {
-    for (int i = 0; i < 8; i++) draw_button(ui, tab_rect(ui, i), view_name((View)i), view == (View)i);
+    for (int i = 0; i < 9; i++) draw_button(ui, tab_rect(ui, i), view_name((View)i), view == (View)i);
 }
 
 static void panel_title(Gui *ui, Rect r, const char *title) {
@@ -2148,7 +2783,7 @@ static void draw_dashboard(Gui *ui, const Target *t, const Stats *st, int interv
                            bool adaptive, bool monitor_clocks, const ClientMonitor *cm,
                            const PowerTelemetry *p, const SessionInfo *si, const EventLog *el,
                            const TraceState *tr) {
-    int top = 342, gap = 10, margin = 12;
+    int top = 377, gap = 10, margin = 12;
     int w = (ui->width - margin * 2 - gap) / 2;
     int bottom = ui->height - 82;
     int h = (bottom - top - gap * 2) / 3;
@@ -2189,7 +2824,7 @@ static void draw_dashboard(Gui *ui, const Target *t, const Stats *st, int interv
 }
 
 static void draw_clients_page(Gui *ui, const ClientMonitor *cm) {
-    int y = 350;
+    int y = 385;
     gui_text(ui,16,y,ui->accent,true,"Per-process DRM activity"); y += 25;
     gui_text(ui,16,y,ui->dim,false,"PID      PROCESS / ROLE                          TOTAL    GFX   COMP    DMA  MEDIA      VRAM"); y += 20;
     int max = cm->count < 14 ? cm->count : 14;
@@ -2204,15 +2839,32 @@ static void draw_clients_page(Gui *ui, const ClientMonitor *cm) {
 }
 
 static void draw_power_page(Gui *ui, const Target *t, const Stats *st, const PowerTelemetry *p,
+                            const Sysfs *s, const SystemTelemetry *sys,
                             bool monitor_clocks, int dpm_interval_us) {
-    int x=18,y=350;
-    gui_text(ui,x,y,ui->accent,true,"Power and DPM telemetry"); y+=30;
+    int x=18,y=385;
+    gui_text(ui,x,y,ui->accent,true,"Power, thermal, and DPM telemetry"); y+=30;
     gui_text(ui,x,y,ui->fg,false,"Policy target: %s    watchdog: %s",t->policy,t->enabled?"enforcing":"paused"); y+=24;
     gui_text(ui,x,y,ui->fg,false,"GPU busy %d%%   MEM busy %d%%   board power %.2f W",p->gpu_busy,p->mem_busy,p->power_w); y+=24;
-    gui_text(ui,x,y,ui->fg,false,"Temperature %.1f C   fan %d RPM / %.1f%%   voltage %.3f V",p->temp_c,p->fan_rpm,p->fan_pct,p->voltage_v); y+=24;
+    gui_text(ui,x,y,ui->fg,false,"Power cap %.1f W   firmware range %.1f - %.1f W",
+             p->power_cap_w,p->power_cap_min_w,p->power_cap_max_w); y+=24;
+
+    for (int i=0;i<MAX_GPU_TEMPS;i++) {
+        if (p->temps_c[i] < 0.0) continue;
+        double crit=s->temp_crit_mc[i]>0?s->temp_crit_mc[i]/1000.0:-1.0;
+        double emerg=s->temp_emergency_mc[i]>0?s->temp_emergency_mc[i]/1000.0:-1.0;
+        gui_text(ui,x,y,tune_zone_color(ui,temperature_zone(p->temps_c[i],s->temp_crit_mc[i],s->temp_emergency_mc[i])),true,
+                 "%s %.1f C   crit %.1f C   emergency %.1f C",
+                 s->temp_label[i][0]?s->temp_label[i]:"GPU",p->temps_c[i],crit,emerg); y+=23;
+    }
+    if (sys->cpu_temp_c >= 0.0) {
+        double crit=sys->cpu_temp_crit_mc>0?sys->cpu_temp_crit_mc/1000.0:-1.0;
+        gui_text(ui,x,y,tune_zone_color(ui,temperature_zone(sys->cpu_temp_c,sys->cpu_temp_crit_mc,-1)),true,
+                 "CPU %s %.1f C   crit %.1f C",sys->cpu_temp_label,sys->cpu_temp_c,crit); y+=23;
+    }
+
+    gui_text(ui,x,y,ui->fg,false,"Fan %d RPM / %.1f%%   voltage %.3f V",p->fan_rpm,p->fan_pct,p->voltage_v); y+=24;
     gui_text(ui,x,y,ui->fg,false,"Current %.2f A%s (%s)   12V equivalent load %.3f ohm",
-             p->current_a,p->current_is_estimate?" estimated":"",p->current_label,
-             p->equivalent_input_ohm); y+=24;
+             p->current_a,p->current_is_estimate?" estimated":"",p->current_label,p->equivalent_input_ohm); y+=24;
     gui_text(ui,x,y,ui->fg,false,"GFX %.0f MHz (%s)   MEM %.0f MHz (%s)",p->gfx_hz/1000000.0,p->freq1_label,p->mem_hz/1000000.0,p->freq2_label); y+=24;
     gui_text(ui,x,y,ui->fg,false,"GFXOFF %s   transitions %llu   enabled %d",gfxoff_text(p->gfxoff_status),(unsigned long long)p->gfxoff_status_changes,p->gfxoff_enabled); y+=24;
     gui_text(ui,x,y,ui->dim,false,"Power profile: %.140s",p->power_profile); y+=24;
@@ -2224,12 +2876,110 @@ static void draw_power_page(Gui *ui, const Target *t, const Stats *st, const Pow
              (unsigned long long)st->observed_sclk_changes,(unsigned long long)st->observed_mclk_changes,
              monitor_clocks?"ON":"off",1000000.0/dpm_interval_us); y+=24;
     gui_text(ui,x,y,ui->dim,false,"SCLK: %.150s",st->sclk_display[0]?st->sclk_display:"not sampled"); y+=22;
-    gui_text(ui,x,y,ui->dim,false,"MCLK: %.150s",st->mclk_display[0]?st->mclk_display:"not sampled"); y+=30;
-    gui_text(ui,x,y,ui->warn,true,"Manual mode: S = cycle GFX DPM level, M = cycle memory DPM level, X = clear manual locks");
+    gui_text(ui,x,y,ui->dim,false,"MCLK: %.150s",st->mclk_display[0]?st->mclk_display:"not sampled");
+}
+
+static void draw_tuning_row(Gui *ui, int row, const char *name, const char *value,
+                            const char *range, TuneZone zone, bool available) {
+    int y = 500 + row * 68;
+    Rect panel = {18, y, ui->width - 36, 54};
+    gui_fill(ui, panel, ui->panel);
+    gui_outline(ui, panel, available ? tune_zone_color(ui, zone) : ui->dim);
+    gui_text(ui, 30, y + 22, available ? ui->fg : ui->dim, true, "%s", name);
+    gui_text(ui, 230, y + 22, available ? tune_zone_color(ui, zone) : ui->dim, true, "%s", value);
+    gui_text(ui, 420, y + 22, ui->dim, false, "%s", range);
+    if (available) {
+        draw_button(ui, tuning_minus_rect(ui,row), "-", false);
+        draw_button(ui, tuning_plus_rect(ui,row), "+", false);
+    } else {
+        Rect mr=tuning_minus_rect(ui,row), pr=tuning_plus_rect(ui,row);
+        gui_fill(ui,mr,ui->panel_alt); gui_outline(ui,mr,ui->dim);
+        gui_fill(ui,pr,ui->panel_alt); gui_outline(ui,pr,ui->dim);
+        gui_text(ui,mr.x+28,mr.y+21,ui->dim,true,"-");
+        gui_text(ui,pr.x+28,pr.y+21,ui->dim,true,"+");
+    }
+}
+
+static void draw_tuning_page(Gui *ui, const TuningState *t) {
+    int x=18,y=385;
+    gui_text(ui,x,y,ui->accent,true,"Software tuning - firmware bounded"); y+=28;
+    gui_text(ui,x,y,ui->warn,true,
+             "Green/amber/red = aggressiveness relative to captured stock, NOT a hardware-safety guarantee."); y+=26;
+
+    if (t->spec) {
+        gui_text(ui,x,y,ui->fg,true,"%s   %s / %s",t->spec->name,t->spec->series,t->spec->architecture); y+=23;
+        gui_text(ui,x,y,ui->dim,false,
+                 "AMD reference: game %d MHz   boost %d MHz   TBP %d W   %d MB %s @ %.1f Gbps / %d-bit",
+                 t->spec->game_mhz,t->spec->boost_mhz,t->spec->tbp_w,t->spec->vram_mb,t->spec->memory_type,
+                 t->spec->memory_mbps/1000.0,t->spec->memory_bus_bits); y+=23;
+    } else {
+        gui_text(ui,x,y,ui->dim,false,"No exact reference-card match; driver/firmware ranges remain fully authoritative."); y+=23;
+    }
+    gui_text(ui,x,y,ui->dim,false,"Built-in reference database: %zu desktop Radeon models.",gpu_spec_count());
+
+    char value[96], range[160];
+    TuneZone z;
+
+    if (t->has_sclk) {
+        snprintf(value,sizeof(value),"%ld MHz",t->edit_sclk_max_mhz);
+        snprintf(range,sizeof(range),"stock %ld | firmware %ld..%ld MHz",
+                 t->default_sclk_max_mhz,t->sclk_limit_min_mhz,t->sclk_limit_max_mhz);
+        z=tuning_zone_long(t->edit_sclk_max_mhz,t->default_sclk_max_mhz,t->sclk_limit_max_mhz);
+        draw_tuning_row(ui,0,"GFX MAX CLOCK",value,range,z,true);
+    } else if (t->has_sclk_offset) {
+        snprintf(value,sizeof(value),"%+ld MHz",t->edit_sclk_offset_mhz);
+        snprintf(range,sizeof(range),"stock %+ld | firmware %+ld..%+ld MHz",
+                 t->default_sclk_offset_mhz,t->sclk_offset_min_mhz,t->sclk_offset_max_mhz);
+        z=tuning_zone_offset(t->edit_sclk_offset_mhz,t->sclk_offset_max_mhz);
+        draw_tuning_row(ui,0,"GFX CLOCK OFFSET",value,range,z,true);
+    } else {
+        draw_tuning_row(ui,0,"GFX CLOCK","unavailable","driver exposes no supported modern OD clock control",TUNE_ZONE_UNAVAILABLE,false);
+    }
+
+    if (t->has_mclk) {
+        snprintf(value,sizeof(value),"%ld MHz controller",t->edit_mclk_max_mhz);
+        snprintf(range,sizeof(range),"stock %ld | firmware %ld..%ld MHz",
+                 t->default_mclk_max_mhz,t->mclk_limit_min_mhz,t->mclk_limit_max_mhz);
+        z=tuning_zone_long(t->edit_mclk_max_mhz,t->default_mclk_max_mhz,t->mclk_limit_max_mhz);
+        draw_tuning_row(ui,1,"MEMORY MAX CLOCK",value,range,z,true);
+    } else {
+        draw_tuning_row(ui,1,"MEMORY CLOCK","unavailable","driver exposes no supported modern MCLK control",TUNE_ZONE_UNAVAILABLE,false);
+    }
+
+    if (t->has_vdd_offset) {
+        snprintf(value,sizeof(value),"%+ld mV",t->edit_vdd_offset_mv);
+        snprintf(range,sizeof(range),"stock %+ld | firmware %+ld..%+ld mV",
+                 t->default_vdd_offset_mv,t->vdd_offset_min_mv,t->vdd_offset_max_mv);
+        z=tuning_zone_offset(t->edit_vdd_offset_mv,t->vdd_offset_max_mv);
+        draw_tuning_row(ui,2,"VDDGFX OFFSET",value,range,z,true);
+    } else {
+        draw_tuning_row(ui,2,"VDDGFX OFFSET","unavailable","not exposed by this ASIC/driver",TUNE_ZONE_UNAVAILABLE,false);
+    }
+
+    if (t->has_power_cap) {
+        snprintf(value,sizeof(value),"%.0f W",t->edit_power_cap_w);
+        snprintf(range,sizeof(range),"stock %.0f | firmware %.0f..%.0f W%s%d%s",
+                 t->default_power_cap_w,t->power_cap_min_w,t->power_cap_max_w,
+                 t->spec?" | AMD ref TBP ":"",t->spec?t->spec->tbp_w:0,t->spec?" W":"");
+        z=tuning_zone_double(t->edit_power_cap_w,t->default_power_cap_w,t->power_cap_max_w);
+        draw_tuning_row(ui,3,"POWER CAP",value,range,z,true);
+    } else {
+        draw_tuning_row(ui,3,"POWER CAP","unavailable","power1_cap is not exposed by this driver/board",TUNE_ZONE_UNAVAILABLE,false);
+    }
+
+    char arm[64];
+    snprintf(arm,sizeof(arm),"ARM WRITES: %s",t->armed?"ARMED":"disarmed");
+    draw_button(ui,tuning_action_rect(ui,0),arm,t->armed);
+    draw_button(ui,tuning_action_rect(ui,1),"APPLY",false);
+    draw_button(ui,tuning_action_rect(ui,2),"RESET STOCK",false);
+    draw_button(ui,tuning_action_rect(ui,3),"REFRESH",false);
+
+    gui_text(ui,20,865,ui->dim,false,
+             "Clock/voltage writes use pp_od_clk_voltage; power cap uses hwmon. Unsupported/legacy formats stay read-only.");
 }
 
 static void draw_desktop_page(Gui *ui, const SessionInfo *si) {
-    int x=18,y=350;
+    int x=18,y=385;
     gui_text(ui,x,y,ui->accent,true,"X11 / XLibre rendering stack"); y+=30;
     gui_text(ui,x,y,ui->fg,false,"Session: %s   Display: %s",si->session_type,si->display); y+=24;
     gui_text(ui,x,y,ui->fg,false,"X server vendor: %.100s",si->xserver_vendor[0]?si->xserver_vendor:"unknown"); y+=24;
@@ -2243,7 +2993,7 @@ static void draw_desktop_page(Gui *ui, const SessionInfo *si) {
 }
 
 static void draw_events_page(Gui *ui, const EventLog *el) {
-    int y=350;
+    int y=385;
     gui_text(ui,16,y,ui->accent,true,"Diagnostic flight recorder - newest first"); y+=26;
     int max=el->count<15?el->count:15;
     for(int n=0;n<max;n++) {
@@ -2258,7 +3008,7 @@ static void draw_events_page(Gui *ui, const EventLog *el) {
 }
 
 static void draw_trace_page(Gui *ui, const TraceState *tr) {
-    int x=18,y=350;
+    int x=18,y=385;
     gui_text(ui,x,y,ui->accent,true,"Kernel tracefs diagnostics"); y+=30;
     gui_text(ui,x,y,ui->fg,false,"Available: %s   Active: %s   total lines %llu",tr->available?"yes":"no",tr->active?"YES":"no",(unsigned long long)tr->lines); y+=24;
     gui_text(ui,x,y,ui->fg,false,"AMDGPU events %d   scheduler events %d   DRM events %d",tr->amdgpu_events,tr->drm_sched_events,tr->drm_events); y+=24;
@@ -2270,15 +3020,16 @@ static void draw_trace_page(Gui *ui, const TraceState *tr) {
 }
 
 static void draw_help_page(Gui *ui) {
-    int x=18,y=350;
+    int x=18,y=385;
     gui_text(ui,x,y,ui->accent,true,"Keyboard / mouse controls"); y+=30;
     const char *lines[] = {
         "1 Auto    2 Low    3 High    4 Standard    5 Min-GFX    6 Min-MEM    7 Peak    8 Manual",
-        "0 Home    P Clients    G Power    W Desktop    E Events    R Trace    H Help    I About",
+        "0 Home    P Clients    G Power    U Tuning    W Desktop    E Events    R Trace    H Help    I About",
         "Space pause/resume watchdog    A adaptive burst    C DPM clock telemetry",
         "+ faster watchdog    - slower watchdog    D cycle DPM telemetry rate",
         "S cycle manual GFX level    M cycle manual memory level    X clear manual level locks",
-        "T kernel trace on/off    L CSV event logging on/off    Q quit",
+        "U tuning page    T kernel trace on/off    L CSV event logging on/off    Q quit",
+        "Tuning writes require ARM then APPLY. RESET STOCK uses driver reset and captured stock power cap.",
         "All tabs, power modes, and the main toggles are also clickable.",
         "The GUI uses plain Xlib: no GTK, Qt, ncurses, Electron, XCB, or libdrm dependency."
     };
@@ -2286,7 +3037,7 @@ static void draw_help_page(Gui *ui) {
 }
 
 static void draw_about_page(Gui *ui) {
-    int x = 18, y = 350;
+    int x = 18, y = 385;
 
     gui_text(ui, x, y, ui->accent, true, "AMD GPU Diagnostic Tool"); y += 32;
     gui_text(ui, x, y, ui->fg, true, "Version %s", VERSION); y += 26;
@@ -2340,14 +3091,16 @@ static void draw_bottom_controls(Gui *ui, const Target *t, bool adaptive, bool m
 static void gui_draw(Gui *ui, const Gpu *g, Sysfs *s, const Target *t, const Stats *st,
                      int interval_us, int dpm_interval_us, bool monitor_clocks, bool adaptive,
                      const ClientMonitor *clients, const PowerTelemetry *power, const SystemTelemetry *system, const SessionInfo *session,
-                     const EventLog *events, const TraceState *trace, View view, const char *message) {
+                     const EventLog *events, const TraceState *trace, const TuningState *tuning,
+                     View view, const char *message) {
     gui_fill(ui,(Rect){0,0,ui->width,ui->height},ui->bg);
     draw_header(ui,g,s,t,power,system,st);
     draw_tabs(ui,view);
     switch(view) {
         case VIEW_DASHBOARD: draw_dashboard(ui,t,st,interval_us,adaptive,monitor_clocks,clients,power,session,events,trace); break;
         case VIEW_CLIENTS: draw_clients_page(ui,clients); break;
-        case VIEW_POWER: draw_power_page(ui,t,st,power,monitor_clocks,dpm_interval_us); break;
+        case VIEW_POWER: draw_power_page(ui,t,st,power,s,system,monitor_clocks,dpm_interval_us); break;
+        case VIEW_TUNING: draw_tuning_page(ui,tuning); break;
         case VIEW_DESKTOP: draw_desktop_page(ui,session); break;
         case VIEW_EVENTS: draw_events_page(ui,events); break;
         case VIEW_TRACE: draw_trace_page(ui,trace); break;
@@ -2460,6 +3213,7 @@ static void handle_action(char key, Sysfs *s, Target *target, int *interval_us, 
     else if(key=='0') *view=VIEW_DASHBOARD;
     else if(key=='p'||key=='P') *view=VIEW_CLIENTS;
     else if(key=='g'||key=='G') *view=VIEW_POWER;
+    else if(key=='u'||key=='U') *view=VIEW_TUNING;
     else if(key=='w'||key=='W') *view=VIEW_DESKTOP;
     else if(key=='e'||key=='E') *view=VIEW_EVENTS;
     else if(key=='r'||key=='R') *view=VIEW_TRACE;
@@ -2493,12 +3247,67 @@ static char keysym_to_action(XKeyEvent *ke) {
     return 0;
 }
 
-static void handle_click(Gui *ui, int x, int y, Sysfs *s, Target *target, int *interval_us,
-                         int *dpm_interval_us, bool *monitor_clocks, bool *adaptive,
+static bool tuning_row_available(const TuningState *t, int row) {
+    switch (row) {
+        case 0: return t->has_sclk || t->has_sclk_offset;
+        case 1: return t->has_mclk;
+        case 2: return t->has_vdd_offset;
+        case 3: return t->has_power_cap;
+        default: return false;
+    }
+}
+
+static void handle_click(Gui *ui, int x, int y, Sysfs *s, Target *target, TuningState *tuning,
+                         int *interval_us, int *dpm_interval_us, bool *monitor_clocks, bool *adaptive,
                          long long *burst_until_ns, TraceState *trace, EventLog *events,
                          View *view, char *message, size_t message_cap) {
-    for(int i=0;i<8;i++) if(point_in(tab_rect(ui,i),x,y)){*view=(View)i;message[0]=0;return;}
-    for(int i=0;i<8;i++) if(point_in(mode_rect(ui,i),x,y)){set_mode(s,target,i,message,message_cap);return;}
+    for(int i=0;i<9;i++) {
+        if(point_in(tab_rect(ui,i),x,y)) {
+            *view=(View)i;
+            message[0]=0;
+            return;
+        }
+    }
+    for(int i=0;i<8;i++) {
+        if(point_in(mode_rect(ui,i),x,y)) {
+            set_mode(s,target,i,message,message_cap);
+            return;
+        }
+    }
+
+    if (*view == VIEW_TUNING) {
+        for (int row=0; row<4; row++) {
+            if (point_in(tuning_minus_rect(ui,row),x,y) || point_in(tuning_plus_rect(ui,row),x,y)) {
+                if (!tuning_row_available(tuning,row)) {
+                    snprintf(message,message_cap,"That tuning control is not exposed by this ASIC/driver.");
+                    return;
+                }
+                int dir=point_in(tuning_minus_rect(ui,row),x,y)?-1:+1;
+                tuning_adjust(tuning,row,dir);
+                snprintf(message,message_cap,"Tuning edit changed; ARM + APPLY required to write.");
+                return;
+            }
+        }
+        if (point_in(tuning_action_rect(ui,0),x,y)) {
+            tuning->armed = !tuning->armed;
+            snprintf(message,message_cap,"Tuning writes %s.",tuning->armed?"ARMED":"disarmed");
+            return;
+        }
+        if (point_in(tuning_action_rect(ui,1),x,y)) {
+            (void)tuning_apply(s,target,tuning,message,message_cap);
+            return;
+        }
+        if (point_in(tuning_action_rect(ui,2),x,y)) {
+            (void)tuning_reset(s,target,tuning,message,message_cap);
+            return;
+        }
+        if (point_in(tuning_action_rect(ui,3),x,y)) {
+            tuning_refresh(s,tuning,false);
+            snprintf(message,message_cap,"Tuning state refreshed from driver.");
+            return;
+        }
+    }
+
     for(int i=0;i<5;i++) if(point_in(control_rect(ui,i),x,y)){
         char key=i==0?' ':i==1?'A':i==2?'C':i==3?'T':'L';
         handle_action(key,s,target,interval_us,dpm_interval_us,monitor_clocks,adaptive,burst_until_ns,trace,events,view,message,message_cap);
@@ -2550,10 +3359,19 @@ int main(int argc, char **argv) {
 
     Stats st={0}; st.last_active_sclk=st.last_active_mclk=INT_MIN;
     ClientMonitor clients={0};
-    PowerTelemetry power={.gpu_busy=-1,.mem_busy=-1,.temp_c=-1,.power_w=-1,.voltage_v=-1,.current_a=-1,.equivalent_input_ohm=-1,.fan_rpm=-1,.fan_pct=-1,.gfx_hz=-1,.mem_hz=-1,.gfxoff_enabled=-1,.gfxoff_status=-1,.last_gfxoff_status=-1};
+    PowerTelemetry power={.gpu_busy=-1,.mem_busy=-1,.temp_c=-1,.power_w=-1,.power_cap_w=-1,.power_cap_min_w=-1,.power_cap_max_w=-1,
+                          .voltage_v=-1,.current_a=-1,.equivalent_input_ohm=-1,.fan_rpm=-1,.fan_pct=-1,
+                          .gfx_hz=-1,.mem_hz=-1,.gfxoff_enabled=-1,.gfxoff_status=-1,.last_gfxoff_status=-1};
+    for (int i=0;i<MAX_GPU_TEMPS;i++) power.temps_c[i]=-1.0;
     SystemTelemetry system={0};
+    system.fd_cpu_temp=-1;
+    system.cpu_temp_c=-1.0;
+    system.cpu_temp_crit_mc=-1;
+    TuningState tuning={0};
+    tuning.spec=gpu_spec_match(g->full_name,g->vram_bytes);
     SessionInfo session={0}; EventLog events={0}; TraceState trace; trace_discover(&trace);
     sample_power(&s,&power); sample_system(&system); sample_clients(g,&clients); sample_session(g,&s,&session,&clients);
+    tuning_refresh(&s,&tuning,true);
 
     Gui ui;
     if(gui_init(&ui,&session)<0){sysfs_close(&s);return 1;}
@@ -2601,7 +3419,7 @@ int main(int argc, char **argv) {
                 char key=keysym_to_action(&ev.xkey); if(key=='q'||key=='Q'){g_stop=1;break;}
                 if(key){handle_action(key,&s,&target,&interval_us,&dpm_interval_us,&monitor_clocks,&adaptive,&burst_until_ns,&trace,&events,&view,message,sizeof(message));ui.dirty=true;}
             } else if(ev.type==ButtonPress){
-                handle_click(&ui,ev.xbutton.x,ev.xbutton.y,&s,&target,&interval_us,&dpm_interval_us,&monitor_clocks,&adaptive,&burst_until_ns,&trace,&events,&view,message,sizeof(message));ui.dirty=true;
+                handle_click(&ui,ev.xbutton.x,ev.xbutton.y,&s,&target,&tuning,&interval_us,&dpm_interval_us,&monitor_clocks,&adaptive,&burst_until_ns,&trace,&events,&view,message,sizeof(message));ui.dirty=true;
             }
         }
 
@@ -2610,11 +3428,11 @@ int main(int argc, char **argv) {
             struct timespec cpu1;clock_gettime(CLOCK_THREAD_CPUTIME_ID,&cpu1);double wall=diff_ns(loop_now,stat_wall0)/1e9,cpu=diff_ns(cpu1,stat_cpu0)/1e9;uint64_t dc=st.checks-stat_checks0;
             st.loop_cpu_pct=wall>0?cpu/wall*100.0:0.0;st.loop_hz=wall>0?dc/wall:0.0;stat_wall0=loop_now;stat_cpu0=cpu1;stat_checks0=st.checks;ui.dirty=true;
         }
-        if(ui.dirty&&diff_ns(loop_now,last_ui)>=250000000LL){gui_draw(&ui,g,&s,&target,&st,interval_us,dpm_interval_us,monitor_clocks,adaptive,&clients,&power,&system,&session,&events,&trace,view,message);last_ui=loop_now;}
+        if(ui.dirty&&diff_ns(loop_now,last_ui)>=250000000LL){gui_draw(&ui,g,&s,&target,&st,interval_us,dpm_interval_us,monitor_clocks,adaptive,&clients,&power,&system,&session,&events,&trace,&tuning,view,message);last_ui=loop_now;}
 
         add_ns(&next,(long long)active_interval_us*1000LL);struct timespec now;clock_gettime(CLOCK_MONOTONIC,&now);
         if(diff_ns(next,now)>0)clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&next,NULL);else{st.deadline_misses++;next=now;}
     }
 
-    trace_stop(&trace);if(events.logf)fclose(events.logf);gui_close(&ui);sysfs_close(&s);return 0;
+    trace_stop(&trace);if(events.logf)fclose(events.logf);gui_close(&ui);if(system.fd_cpu_temp>=0)close(system.fd_cpu_temp);sysfs_close(&s);return 0;
 }

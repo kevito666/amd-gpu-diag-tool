@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.6.0
+
+- Added guarded software tuning for firmware-exposed GFX clock/min-max or RDNA4 SCLK offset, memory max clock, VDDGFX offset, and board power cap.
+- Added an explicit ARM → APPLY write gate plus RESET STOCK and REFRESH controls.
+- Added green / amber / red aggressiveness zones relative to captured stock values and firmware-exported ranges.
+- Kept kernel/firmware ranges authoritative; the reference database never overrides driver limits.
+- Added prominent always-visible GPU thermal bars for every AMDGPU hwmon temperature channel and CPU package temperature when available.
+- Added detailed thermal critical/emergency values and power-cap ranges to the Power page.
+- Added a compiled-in 50-model desktop Radeon reference database spanning RX 400/500, Vega/Radeon VII, RX 5000, RX 6000, RX 7000, and RX 9000.
+- Added VRAM-aware matching for same-name capacity variants.
+- Added RDNA4 SCLK-offset support, including detection of the legacy pre-Linux-6.14 indexed representation.
+- Added RDNA1 maximum-clock support while deliberately leaving legacy Polaris/Vega10 multi-state voltage tables out of the modern slider model.
+- Added no new runtime library dependency.
+
+
 ## 0.5.2
 
 - Added a built-in About page with developer, project, technology, development, and GPL information.

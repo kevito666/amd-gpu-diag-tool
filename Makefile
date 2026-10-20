@@ -7,7 +7,7 @@ PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 
 TARGET := amd-gpu-diagnostic
-SRC := src/amd-gpu-diagnostic.c
+SRC := src/amd-gpu-diagnostic.c src/gpu_specs.c
 
 .PHONY: all clean check install uninstall
 
@@ -18,7 +18,7 @@ $(TARGET): $(SRC)
 
 check:
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Werror -o .check-$(TARGET) $(SRC) $(LDFLAGS) $(LDLIBS)
-	./.check-$(TARGET) --version | grep -qx '0.5.2'
+	./.check-$(TARGET) --version | grep -qx '0.6.0'
 	./.check-$(TARGET) --help >/dev/null
 	rm -f .check-$(TARGET)
 
