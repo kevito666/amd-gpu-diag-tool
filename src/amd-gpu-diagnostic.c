@@ -285,6 +285,34 @@ typedef enum {
     WORKFLOW_GAMING
 } WorkflowMode;
 
+/* Frametime tracking for gaming mode */
+#define FRAMETIME_HISTORY_SIZE 300
+#define FRAMETIME_WINDOW_MAX_S 60
+
+typedef struct {
+    double times_ms[FRAMETIME_HISTORY_SIZE];
+    int count;
+    int head;
+    double window_s;  /* Time window for percentile calculations */
+    double avg_ms;
+    double p1_ms;
+    double p01_ms;
+    double p001_ms;
+    double max_ms;
+    double min_ms;
+} FrametimeStats;
+
+/* CPU per-core load */
+#define MAX_CPU_CORES 128
+
+typedef struct {
+    double load_pct[MAX_CPU_CORES];
+    int core_count;
+    unsigned long long prev_core_total[MAX_CPU_CORES];
+    unsigned long long prev_core_idle[MAX_CPU_CORES];
+    bool have_sample;
+} CpuCoreLoad;
+
 typedef struct {
     pid_t pid;
     char name[16];
@@ -332,6 +360,14 @@ typedef struct {
     long cpu_temp_crit_mc;
     bool cpu_temp_discovered;
 
+    /* CPU per-CCX temps (k10temp) */
+    int fd_cpu_ccx_temp[4];
+    char cpu_ccx_temp_paths[4][MAX_PATH_LEN];
+    char cpu_ccx_temp_labels[4][32];
+    double cpu_ccx_temp_c[4];
+    int cpu_ccx_temp_count;
+    bool cpu_ccx_temp_discovered;
+
     /* CPU fan */
     int fd_cpu_fan_rpm;
     char cpu_fan_rpm_path[MAX_PATH_LEN];
@@ -340,6 +376,12 @@ typedef struct {
     char cpu_fan_pct_path[MAX_PATH_LEN];
     double cpu_fan_pct;
     bool cpu_fan_discovered;
+
+    /* CPU power */
+    int fd_cpu_power;
+    char cpu_power_path[MAX_PATH_LEN];
+    double cpu_power_w;
+    bool cpu_power_discovered;
 
     /* Motherboard temperatures */
     int mb_temp_count;
@@ -359,6 +401,11 @@ typedef struct {
     bool llama_available;
     bool ollama_available;
     bool vllm_available;
+
+    /* Gaming mode metrics */
+    FrametimeStats frametimes;
+    CpuCoreLoad cpu_cores;
+    double input_latency_ms;
 } SystemTelemetry;
 
 typedef enum {
@@ -1610,6 +1657,46 @@ static void discover_cpu_temp(SystemTelemetry *s) {
     }
 }
 
+static void discover_cpu_ccx_temps(SystemTelemetry *s) {
+    if (s->cpu_ccx_temp_discovered) return;
+    s->cpu_ccx_temp_discovered = true;
+    s->cpu_ccx_temp_count = 0;
+
+    DIR *d = opendir("/sys/class/hwmon");
+    if (!d) return;
+    struct dirent *de;
+
+    while ((de = readdir(d))) {
+        if (strncmp(de->d_name, "hwmon", 5) != 0) continue;
+        char base[MAX_PATH_LEN], namep[MAX_PATH_LEN], name[64] = "";
+        if (!path_join(base, sizeof(base), "/sys/class/hwmon", de->d_name)) continue;
+        if (!path_join(namep, sizeof(namep), base, "name")) continue;
+        if (read_path_text(namep, name, sizeof(name)) < 0) continue;
+        if (!strcasestr(name, "k10temp")) continue;
+
+        for (int ti = 1; ti <= 8 && s->cpu_ccx_temp_count < 4; ti++) {
+            char inp[MAX_PATH_LEN], labp[MAX_PATH_LEN], label[64] = "", leaf[32];
+            snprintf(leaf, sizeof(leaf), "temp%d_input", ti);
+            if (!path_join(inp, sizeof(inp), base, leaf) || !path_exists(inp)) continue;
+            snprintf(leaf, sizeof(leaf), "temp%d_label", ti);
+            if (path_join(labp, sizeof(labp), base, leaf))
+                (void)read_path_text(labp, label, sizeof(label));
+
+            int idx = s->cpu_ccx_temp_count;
+            s->fd_cpu_ccx_temp[idx] = open(inp, O_RDONLY | O_CLOEXEC);
+            if (s->fd_cpu_ccx_temp[idx] < 0) continue;
+            text_copy(s->cpu_ccx_temp_paths[idx], sizeof(s->cpu_ccx_temp_paths[idx]), inp);
+            if (label[0])
+                text_copy(s->cpu_ccx_temp_labels[idx], sizeof(s->cpu_ccx_temp_labels[idx]), label);
+            else
+                snprintf(s->cpu_ccx_temp_labels[idx], sizeof(s->cpu_ccx_temp_labels[idx]), "CCX%d", ti - 1);
+            s->cpu_ccx_temp_count++;
+        }
+        if (s->cpu_ccx_temp_count > 0) break;
+    }
+    closedir(d);
+}
+
 static void discover_cpu_fan(SystemTelemetry *s) {
     if (s->cpu_fan_discovered) return;
     s->cpu_fan_discovered = true;
@@ -1650,6 +1737,36 @@ static void discover_cpu_fan(SystemTelemetry *s) {
     closedir(d);
 }
 
+static void discover_cpu_power(SystemTelemetry *s) {
+    if (s->cpu_power_discovered) return;
+    s->cpu_power_discovered = true;
+    s->fd_cpu_power = -1;
+
+    DIR *d = opendir("/sys/class/hwmon");
+    if (!d) return;
+    struct dirent *de;
+
+    while ((de = readdir(d))) {
+        if (strncmp(de->d_name, "hwmon", 5) != 0) continue;
+        char base[MAX_PATH_LEN], namep[MAX_PATH_LEN], name[64] = "";
+        if (!path_join(base, sizeof(base), "/sys/class/hwmon", de->d_name)) continue;
+        if (!path_join(namep, sizeof(namep), base, "name")) continue;
+        if (read_path_text(namep, name, sizeof(name)) < 0) continue;
+
+        /* Look for k10temp or zenpower power sensor */
+        if (strcasestr(name, "k10temp") || strcasestr(name, "zenpower")) {
+            char powp[MAX_PATH_LEN];
+            if (path_join(powp, sizeof(powp), base, "power1_input") && path_exists(powp)) {
+                s->fd_cpu_power = open(powp, O_RDONLY | O_CLOEXEC);
+                if (s->fd_cpu_power >= 0)
+                    text_copy(s->cpu_power_path, sizeof(s->cpu_power_path), powp);
+                break;
+            }
+        }
+    }
+    closedir(d);
+}
+
 static void discover_motherboard_temps(SystemTelemetry *s) {
     if (s->mb_temp_discovered) return;
     s->mb_temp_discovered = true;
@@ -1667,9 +1784,11 @@ static void discover_motherboard_temps(SystemTelemetry *s) {
         if (!path_join(namep, sizeof(namep), base, "name")) continue;
         if (read_path_text(namep, name, sizeof(name)) < 0) continue;
 
-        /* Skip k10temp (CPU) and amdgpu */
+        /* Skip CPU, GPU, NVMe, battery devices - only keep RAM/motherboard/VRM temps */
         if (strcasestr(name, "k10temp") || strcasestr(name, "zenpower") ||
-            strcasestr(name, "amdgpu")) continue;
+            strcasestr(name, "amdgpu") || strcasestr(name, "nvme") ||
+            strcasestr(name, "battery") || strcasestr(name, "hidpp") ||
+            strcasestr(name, "asusec")) continue;
 
         /* Look for temp sensors that might be RAM or PCIe */
         for (int ti = 1; ti <= 8 && s->mb_temp_count < 4; ti++) {
@@ -1681,6 +1800,9 @@ static void discover_motherboard_temps(SystemTelemetry *s) {
                 if (path_join(labp, sizeof(labp), base, leaf))
                     (void)read_path_text(labp, label, sizeof(label));
             }
+
+            /* Skip temps with "cpu" in the label */
+            if (label[0] && strcasestr(label, "cpu")) continue;
 
             int idx = s->mb_temp_count;
             s->mb_temp_fds[idx] = open(inp, O_RDONLY | O_CLOEXEC);
@@ -1783,6 +1905,101 @@ static void sample_top_processes(SystemTelemetry *s) {
     s->top_proc_count = take;
 }
 
+/* Sort helper for percentile calculations */
+static void sort_doubles(double *arr, int n) {
+    for (int i = 0; i < n - 1; i++) {
+        for (int j = i + 1; j < n; j++) {
+            if (arr[j] < arr[i]) {
+                double tmp = arr[i];
+                arr[i] = arr[j];
+                arr[j] = tmp;
+            }
+        }
+    }
+}
+
+static double percentile(const double *arr, int n, double p) {
+    if (n <= 0) return 0.0;
+    if (n == 1) return arr[0];
+    double sorted[FRAMETIME_HISTORY_SIZE];
+    memcpy(sorted, arr, n * sizeof(double));
+    sort_doubles(sorted, n);
+    double rank = p / 100.0 * (n - 1);
+    int lower = (int)rank;
+    int upper = lower + 1;
+    double frac = rank - lower;
+    if (upper >= n) return sorted[n - 1];
+    return sorted[lower] + frac * (sorted[upper] - sorted[lower]);
+}
+
+/* Sample CPU per-core load from /proc/stat */
+static void sample_cpu_cores(SystemTelemetry *s) {
+    FILE *f = fopen("/proc/stat", "r");
+    if (!f) return;
+
+    int core = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] != 'c' || line[1] != 'p' || line[2] != 'u') break;
+        if (line[3] == ' ') break;  /* This is the aggregate 'cpu' line */
+
+        unsigned long long user=0, nice=0, system=0, idle=0, iowait=0, irq=0, softirq=0, steal=0;
+        int n = sscanf(line, "cpu%d %llu %llu %llu %llu %llu %llu %llu %llu",
+                       &core, &user, &nice, &system, &idle, &iowait, &irq, &softirq, &steal);
+        if (n < 4) break;
+
+        core--;  /* Convert to 0-indexed */
+        if (core < 0 || core >= MAX_CPU_CORES) break;
+
+        unsigned long long idle_all = idle + iowait;
+        unsigned long long total = user + nice + system + idle_all + irq + softirq + steal;
+
+        if (s->cpu_cores.have_sample && total >= s->cpu_cores.prev_core_total[core] &&
+            idle_all >= s->cpu_cores.prev_core_idle[core]) {
+            unsigned long long dt = total - s->cpu_cores.prev_core_total[core];
+            unsigned long long di = idle_all - s->cpu_cores.prev_core_idle[core];
+            s->cpu_cores.load_pct[core] = (dt && di <= dt) ? (double)(dt - di) * 100.0 / (double)dt : 0.0;
+        }
+
+        s->cpu_cores.prev_core_total[core] = total;
+        s->cpu_cores.prev_core_idle[core] = idle_all;
+        if (core + 1 > s->cpu_cores.core_count) {
+            s->cpu_cores.core_count = core + 1;
+        }
+    }
+    fclose(f);
+
+    if (!s->cpu_cores.have_sample) {
+        s->cpu_cores.have_sample = true;
+    }
+}
+
+/* Record a frametime sample and update statistics */
+static void record_frametime(FrametimeStats *ft, double ms) {
+    if (ms <= 0.0 || ms > 1000.0) return;  /* Sanity check */
+
+    ft->times_ms[ft->head] = ms;
+    ft->head = (ft->head + 1) % FRAMETIME_HISTORY_SIZE;
+    if (ft->count < FRAMETIME_HISTORY_SIZE) ft->count++;
+
+    /* Update running statistics */
+    if (ms > ft->max_ms) ft->max_ms = ms;
+    if (ft->min_ms <= 0.0 || ms < ft->min_ms) ft->min_ms = ms;
+
+    /* Recalculate percentiles from full history */
+    if (ft->count >= 10) {
+        ft->avg_ms = 0.0;
+        for (int i = 0; i < ft->count; i++) {
+            ft->avg_ms += ft->times_ms[i];
+        }
+        ft->avg_ms /= ft->count;
+
+        ft->p1_ms = percentile(ft->times_ms, ft->count, 1.0);
+        ft->p01_ms = percentile(ft->times_ms, ft->count, 0.1);
+        ft->p001_ms = percentile(ft->times_ms, ft->count, 0.01);
+    }
+}
+
 static void sample_system(SystemTelemetry *s) {
     FILE *f = fopen("/proc/stat", "r");
     if (f) {
@@ -1830,6 +2047,13 @@ static void sample_system(SystemTelemetry *s) {
     long cpu_mc = read_long_fd(s->fd_cpu_temp, -1);
     s->cpu_temp_c = cpu_mc >= 0 ? cpu_mc / 1000.0 : -1.0;
 
+    /* CPU CCX temps */
+    discover_cpu_ccx_temps(s);
+    for (int i = 0; i < s->cpu_ccx_temp_count; i++) {
+        long mc = read_long_fd(s->fd_cpu_ccx_temp[i], -1);
+        s->cpu_ccx_temp_c[i] = mc >= 0 ? mc / 1000.0 : -1.0;
+    }
+
     /* CPU fan */
     discover_cpu_fan(s);
     if (s->fd_cpu_fan_rpm >= 0) {
@@ -1848,6 +2072,13 @@ static void sample_system(SystemTelemetry *s) {
         s->cpu_fan_pct = pwm >= 0 && pwm_max > 0 ? (double)pwm * 100.0 / (double)pwm_max : 0.0;
     }
 
+    /* CPU power */
+    discover_cpu_power(s);
+    if (s->fd_cpu_power >= 0) {
+        long uw = read_long_fd(s->fd_cpu_power, -1);
+        s->cpu_power_w = uw >= 0 ? uw / 1000000.0 : -1.0;
+    }
+
     /* Motherboard temps */
     discover_motherboard_temps(s);
     for (int i = 0; i < s->mb_temp_count; i++) {
@@ -1857,6 +2088,9 @@ static void sample_system(SystemTelemetry *s) {
 
     /* Top processes */
     sample_top_processes(s);
+
+    /* CPU per-core load */
+    sample_cpu_cores(s);
 }
 
 
@@ -3379,10 +3613,165 @@ static void panel_title(Gui *ui, Rect r, const char *title) {
     gui_text(ui, r.x + 10, r.y + 20, ui->accent, true, "%s", title);
 }
 
-static void draw_dashboard(Gui *ui, const Target *t, const Stats *st, int interval_us,
-                           bool adaptive, bool monitor_clocks, const ClientMonitor *cm,
-                           const PowerTelemetry *p, const SessionInfo *si, const EventLog *el,
-                           const TraceState *tr, const SystemTelemetry *sys) {
+/* GAMING MODE DASHBOARD */
+static void draw_gaming_dashboard(Gui *ui, const Gpu *g, const Sysfs *s,
+                                  const PowerTelemetry *p, const SystemTelemetry *sys,
+                                  const FrametimeStats *ft) {
+    int margin = 12, gap = 10;
+    int top = 377;
+    char label[128];
+
+    /* Row 1: GPU Power | GPU Temp | GPU Memory */
+    int w = (ui->width - margin * 2 - gap * 2) / 3;
+    int h = 80;
+    Rect r[3] = {
+        {margin, top, w, h},
+        {margin + w + gap, top, w, h},
+        {margin + 2*(w + gap), top, w, h}
+    };
+
+    panel_title(ui, r[0], "GPU POWER");
+    if (p->power_w >= 0.0) {
+        double power_pct = p->power_w * 100.0 / POWER_BAR_MAX_W;
+        snprintf(label, sizeof(label), "%.1f W", p->power_w);
+        gui_bar_color(ui, (Rect){r[0].x+10, r[0].y+35, w-20, 22}, power_pct, label, ui->accent);
+    } else {
+        gui_text(ui, r[0].x+10, r[0].y+45, ui->dim, false, "unavailable");
+    }
+
+    panel_title(ui, r[1], "GPU JUNCTION TEMP");
+    if (p->temp_c >= 0.0) {
+        snprintf(label, sizeof(label), "%.1f C", p->temp_c);
+        TuneZone z = temperature_zone(p->temp_c * 1000.0, s->temp_crit_mc[0], s->temp_emergency_mc[0]);
+        unsigned long fill = tune_zone_color(ui, z);
+        gui_bar_color_text(ui, (Rect){r[1].x+10, r[1].y+35, w-20, 22}, p->temp_c, label, fill, ui->text_dark);
+    } else {
+        gui_text(ui, r[1].x+10, r[1].y+45, ui->dim, false, "unavailable");
+    }
+
+    panel_title(ui, r[2], "GPU MEMORY");
+    if (g->vram_bytes > 0) {
+        double vram_pct = (double)p->vram_used * 100.0 / (double)g->vram_bytes;
+        snprintf(label, sizeof(label), "%.2f / %.2f GiB", p->vram_used/1073741824.0, g->vram_bytes/1073741824.0);
+        gui_bar_color(ui, (Rect){r[2].x+10, r[2].y+35, w-20, 22}, vram_pct, label, ui->accent);
+    } else {
+        gui_text(ui, r[2].x+10, r[2].y+45, ui->dim, false, "unavailable");
+    }
+
+    /* Row 2: Frametimes | CPU Load | System Memory */
+    top += h + gap;
+    r[0].y = r[1].y = r[2].y = top;
+
+    panel_title(ui, r[0], "FRAMETIMES");
+    if (ft->count > 0) {
+        gui_text(ui, r[0].x+10, r[0].y+40, ui->fg, false, "Avg: %.2f ms", ft->avg_ms);
+        gui_text(ui, r[0].x+10, r[0].y+60, ui->fg, false, "1%%: %.2f  0.1%%: %.2f  0.01%%: %.2f",
+                 ft->p1_ms, ft->p01_ms, ft->p001_ms);
+        /* Frametime chart (mini bar chart) */
+        int chart_y = r[0].y + 70;
+        int chart_w = w - 20;
+        int chart_h = 15;
+        for (int i = 0; i < 20; i++) {
+            int idx = (ft->head - 1 - i + FRAMETIME_HISTORY_SIZE) % FRAMETIME_HISTORY_SIZE;
+            if (idx < 0 || idx >= ft->count) break;
+            double t = ft->times_ms[idx];
+            int bar_h = (int)(t * chart_h / 33.0);  /* Scale to ~33ms (30fps) */
+            if (bar_h > chart_h) bar_h = chart_h;
+            if (bar_h < 1) bar_h = 1;
+            Rect bar = {r[0].x + 10 + i * (chart_w / 20), chart_y + chart_h - bar_h, chart_w / 20 - 1, bar_h};
+            gui_fill(ui, bar, ui->accent);
+        }
+    } else {
+        gui_text(ui, r[0].x+10, r[0].y+45, ui->dim, false, "No frametime data");
+    }
+
+    panel_title(ui, r[1], "CPU LOAD PER CORE");
+    int core_w = (w - 30) / 4;
+    int core_y = r[1].y + 35;
+    int max_cores = sys->cpu_cores.core_count;
+    if (max_cores > 8) max_cores = 8;
+    for (int i = 0; i < max_cores; i++) {
+        int col = i % 4;
+        int row = i / 4;
+        int cx = r[1].x + 10 + col * (core_w + 8);
+        int cy = core_y + row * 16;
+        snprintf(label, sizeof(label), "C%d %.0f%%", i, sys->cpu_cores.load_pct[i]);
+        gui_text(ui, cx, cy, ui->fg, false, label);
+        /* Mini bar */
+        double load_pct = sys->cpu_cores.load_pct[i];
+        if (load_pct > 100.0) load_pct = 100.0;
+        gui_bar_color(ui, (Rect){cx, cy + 2, core_w - 10, 4}, load_pct, "", ui->accent);
+    }
+
+    panel_title(ui, r[2], "SYSTEM MEMORY");
+    if (sys->ram_total_bytes > 0) {
+        snprintf(label, sizeof(label), "%.2f / %.2f GiB (%.1f%%)",
+                 sys->ram_used_bytes/1073741824.0, sys->ram_total_bytes/1073741824.0, sys->ram_pct);
+        gui_bar_color(ui, (Rect){r[2].x+10, r[2].y+35, w-20, 22}, sys->ram_pct, label, ui->accent);
+    }
+
+    /* Row 3: CPU Temp | Memory Temp | Input Latency */
+    top += h + gap;
+    r[0].y = r[1].y = r[2].y = top;
+
+    panel_title(ui, r[0], "CPU TEMP / POWER");
+    if (sys->cpu_temp_c >= 0.0) {
+        snprintf(label, sizeof(label), "Tctl: %.1f C", sys->cpu_temp_c);
+        TuneZone z = temperature_zone(sys->cpu_temp_c * 1000.0, sys->cpu_temp_crit_mc, -1);
+        unsigned long fill = tune_zone_color(ui, z);
+        gui_bar_color_text(ui, (Rect){r[0].x+10, r[0].y+35, w-20, 22}, sys->cpu_temp_c, label, fill, ui->text_dark);
+    } else {
+        gui_text(ui, r[0].x+10, r[0].y+45, ui->dim, false, "temp unavailable");
+    }
+    /* Show CCX temps if available */
+    int ccx_y = r[0].y + 60;
+    for (int i = 0; i < sys->cpu_ccx_temp_count && i < 2; i++) {
+        if (sys->cpu_ccx_temp_c[i] >= 0.0) {
+            snprintf(label, sizeof(label), "%s: %.1f C", sys->cpu_ccx_temp_labels[i], sys->cpu_ccx_temp_c[i]);
+            gui_text(ui, r[0].x+10, ccx_y, ui->fg, false, label);
+            ccx_y += 16;
+        }
+    }
+    /* CPU power */
+    if (sys->cpu_power_w >= 0.0) {
+        snprintf(label, sizeof(label), "Power: %.1f W", sys->cpu_power_w);
+    } else {
+        double cpu_power_w = (sys->cpu_pct / 100.0) * 120.0;
+        snprintf(label, sizeof(label), "Power: ~%.0f W (est)", cpu_power_w);
+    }
+    gui_text(ui, r[0].x+10, ccx_y, ui->fg, false, label);
+
+    panel_title(ui, r[1], "MOTHERBOARD TEMP");
+    if (sys->mb_temp_count > 0 && sys->mb_temp_c[0] >= 0.0) {
+        snprintf(label, sizeof(label), "%.1f C", sys->mb_temp_c[0]);
+        gui_bar_color_text(ui, (Rect){r[1].x+10, r[1].y+35, w-20, 22}, sys->mb_temp_c[0], label, ui->accent, ui->text_dark);
+        if (sys->mb_temp_count > 1) {
+            for (int i = 1; i < sys->mb_temp_count; i++) {
+                if (sys->mb_temp_c[i] >= 0.0) {
+                    snprintf(label, sizeof(label), "%s: %.1f C", sys->mb_temp_labels[i], sys->mb_temp_c[i]);
+                    gui_text(ui, r[1].x+10, r[1].y+65 + (i-1)*18, ui->fg, false, label);
+                }
+            }
+        }
+    } else {
+        gui_text(ui, r[1].x+10, r[1].y+45, ui->dim, false, "unavailable");
+    }
+
+    panel_title(ui, r[2], "INPUT LATENCY");
+    if (sys->input_latency_ms > 0.0) {
+        snprintf(label, sizeof(label), "%.2f ms", sys->input_latency_ms);
+        gui_text(ui, r[2].x+10, r[2].y+45, ui->fg, false, label);
+    } else {
+        gui_text(ui, r[2].x+10, r[2].y+45, ui->dim, false, "unavailable");
+    }
+}
+
+/* AI MODE DASHBOARD (existing layout) */
+static void draw_ai_dashboard(Gui *ui, const Gpu *g, const Target *t, const Stats *st, int interval_us,
+                              bool adaptive, bool monitor_clocks, const ClientMonitor *cm,
+                              const PowerTelemetry *p, const SessionInfo *si, const EventLog *el,
+                              const TraceState *tr, const SystemTelemetry *sys) {
+    (void)monitor_clocks;
     int top = 377, gap = 10, margin = 12;
     int w = (ui->width - margin * 2 - gap) / 2;
     int h = 90;
@@ -3395,25 +3784,37 @@ static void draw_dashboard(Gui *ui, const Target *t, const Stats *st, int interv
     gui_text(ui,r[0].x+10,r[0].y+45,ui->fg,false,"Target %s   %s",t->policy,t->enabled?"ENFORCING":"PAUSED");
     gui_text(ui,r[0].x+10,r[0].y+68,ui->dim,false,"Base %.1f Hz  Adaptive %s  resets %llu",1000000.0/interval_us,adaptive?"on":"off",(unsigned long long)st->policy_mismatches);
 
-    panel_title(ui, r[1], "POWER / CLOCKS");
-    gui_text(ui,r[1].x+10,r[1].y+45,ui->fg,false,"GPU %d%%  MEM %d%%  %.1f W  %.1f C",p->gpu_busy,p->mem_busy,p->power_w,p->temp_c);
+    panel_title(ui, r[1], "AI PERFORMANCE");
     if (sys->tokens.has_data) {
-        gui_text(ui,r[1].x+10,r[1].y+68,ui->accent,false,"~%.0f tok/s (%s)",sys->tokens.tokens_per_sec,sys->tokens.source_label);
-    } else if (p->gfx_hz >= 0 && p->gfx_hz_max > 0 && p->mem_hz >= 0 && p->mem_hz_max > 0) {
-        gui_text(ui,r[1].x+10,r[1].y+68,ui->dim,false,
-                 "GFX %.0f/%.0f MHz  MEM %.0f/%.0f MHz",
-                 p->gfx_hz/1000000.0, p->gfx_hz_max,
-                 p->mem_hz/1000000.0, p->mem_hz_max);
+        gui_text(ui,r[1].x+10,r[1].y+40,ui->accent,false,"~%.0f tok/s (%s)",sys->tokens.tokens_per_sec,sys->tokens.source_label);
+        /* Power efficiency */
+        if (p->power_w > 0.0) {
+            double tok_per_w = sys->tokens.tokens_per_sec / p->power_w;
+            gui_text(ui,r[1].x+10,r[1].y+58,ui->fg,false,"%.2f tok/s/W  %.1f W",tok_per_w,p->power_w);
+        }
+        /* Total tokens */
+        if (sys->tokens.total_tokens > 0) {
+            gui_text(ui,r[1].x+10,r[1].y+76,ui->dim,false,"Total: %lld tokens",(long long)sys->tokens.total_tokens);
+        }
     } else {
-        gui_text(ui,r[1].x+10,r[1].y+68,ui->dim,false,"GFXOFF %s  DPM monitor %s",gfxoff_text(p->gfxoff_status),monitor_clocks?"on":"off");
+        gui_text(ui,r[1].x+10,r[1].y+45,ui->dim,false,"No AI workload detected");
+        gui_text(ui,r[1].x+10,r[1].y+68,ui->dim,false,"GPU %d%% busy  %.1f W",p->gpu_busy,p->power_w);
     }
 
-    panel_title(ui, r[2], "GPU CLIENTS");
+    panel_title(ui, r[2], "GPU CLIENTS / VRAM");
     const GpuClient *c = top_client(cm);
     if (c) {
-        gui_text(ui,r[2].x+10,r[2].y+45,ui->fg,false,"Top: %s",c->role[0]?c->role:c->name);
-        gui_text(ui,r[2].x+10,r[2].y+68,ui->dim,false,"%.2f%% activity  PID %d",c->activity_pct,c->pid);
-    } else gui_text(ui,r[2].x+10,r[2].y+48,ui->dim,false,"No DRM client activity yet");
+        gui_text(ui,r[2].x+10,r[2].y+40,ui->fg,false,"Top: %s",c->role[0]?c->role:c->name);
+        gui_text(ui,r[2].x+10,r[2].y+58,ui->dim,false,"%.2f%% activity  PID %d",c->activity_pct,c->pid);
+    } else {
+        gui_text(ui,r[2].x+10,r[2].y+40,ui->dim,false,"No DRM client activity yet");
+    }
+    /* VRAM usage */
+    if (g->vram_bytes > 0) {
+        double vram_pct = (double)p->vram_used * 100.0 / (double)g->vram_bytes;
+        gui_text(ui,r[2].x+10,r[2].y+76,ui->fg,false,"VRAM: %.2f/%.2f GiB (%.1f%%)",
+                 p->vram_used/1073741824.0, g->vram_bytes/1073741824.0, vram_pct);
+    }
 
     panel_title(ui, r[3], "X11 / DESKTOP");
     gui_text(ui,r[3].x+10,r[3].y+45,ui->fg,false,"%s / %s",si->session_type,si->desktop);
@@ -3422,7 +3823,7 @@ static void draw_dashboard(Gui *ui, const Target *t, const Stats *st, int interv
     panel_title(ui, r[4], "LAST EVENT");
     const DiagEvent *ev = event_last(el);
     if (ev) {
-        gui_text(ui,r[4].x+10,r[4].y+45,ui->fg,false,"%s: %.60s",ev->kind,ev->detail);
+        gui_text(ui,r[4].x+10,r[4].y+45,ui->fg,false,"%.20s: %.50s",ev->kind,ev->detail);
         gui_text(ui,r[4].x+10,r[4].y+68,ui->dim,false,"Actor %s (%.2f%%)",ev->actor,ev->actor_activity);
     } else gui_text(ui,r[4].x+10,r[4].y+48,ui->dim,false,"No diagnostic events yet");
 
@@ -3436,6 +3837,18 @@ static void draw_dashboard(Gui *ui, const Target *t, const Stats *st, int interv
     for (int i = 0; i < sys->top_proc_count; i++) {
         gui_text(ui, margin + 10 + i * 300, ty + 45, ui->fg, false,
                  "#%d PID %d %s", i+1, sys->top_procs[i].pid, sys->top_procs[i].name);
+    }
+}
+
+/* Main dashboard dispatcher */
+static void draw_dashboard(Gui *ui, const Gpu *g, const Sysfs *s, const Target *t, const Stats *st,
+                           int interval_us, bool adaptive, bool monitor_clocks, const ClientMonitor *cm,
+                           const PowerTelemetry *p, const SessionInfo *si, const EventLog *el,
+                           const TraceState *tr, const SystemTelemetry *sys) {
+    if (g_workflow == WORKFLOW_GAMING) {
+        draw_gaming_dashboard(ui, g, s, p, sys, &sys->frametimes);
+    } else {
+        draw_ai_dashboard(ui, g, t, st, interval_us, adaptive, monitor_clocks, cm, p, si, el, tr, sys);
     }
 }
 
@@ -3741,7 +4154,7 @@ static void gui_draw(Gui *ui, const Gpu *g, Sysfs *s, const Target *t, const Sta
     draw_header(ui,g,s,t,power,system,st);
     draw_tabs(ui,view);
     switch(view) {
-        case VIEW_DASHBOARD: draw_dashboard(ui,t,st,interval_us,adaptive,monitor_clocks,clients,power,session,events,trace,system); break;
+        case VIEW_DASHBOARD: draw_dashboard(ui,g,s,t,st,interval_us,adaptive,monitor_clocks,clients,power,session,events,trace,system); break;
         case VIEW_CLIENTS: draw_clients_page(ui,clients); break;
         case VIEW_POWER: draw_power_page(ui,t,st,power,s,system,monitor_clocks,dpm_interval_us); break;
         case VIEW_TUNING: draw_tuning_page(ui,tuning); break;
@@ -4103,7 +4516,12 @@ int main(int argc, char **argv) {
             struct timespec cpu1;clock_gettime(CLOCK_THREAD_CPUTIME_ID,&cpu1);double wall=diff_ns(loop_now,stat_wall0)/1e9,cpu=diff_ns(cpu1,stat_cpu0)/1e9;uint64_t dc=st.checks-stat_checks0;
             st.loop_cpu_pct=wall>0?cpu/wall*100.0:0.0;st.loop_hz=wall>0?dc/wall:0.0;stat_wall0=loop_now;stat_cpu0=cpu1;stat_checks0=st.checks;ui.dirty=true;
         }
-        if(ui.dirty&&diff_ns(loop_now,last_ui)>=250000000LL){gui_draw(&ui,g,&s,&target,&st,interval_us,dpm_interval_us,monitor_clocks,adaptive,&clients,&power,&system,&session,&events,&trace,&tuning,view,message);last_ui=loop_now;}
+        if(ui.dirty&&diff_ns(loop_now,last_ui)>=250000000LL){
+            double ft_ms = diff_ns(loop_now,last_ui)/1000000.0;
+            if(ft_ms > 0.0 && ft_ms < 1000.0) record_frametime(&system.frametimes, ft_ms);
+            gui_draw(&ui,g,&s,&target,&st,interval_us,dpm_interval_us,monitor_clocks,adaptive,&clients,&power,&system,&session,&events,&trace,&tuning,view,message);
+            last_ui=loop_now;
+        }
 
         add_ns(&next,(long long)active_interval_us*1000LL);struct timespec now;clock_gettime(CLOCK_MONOTONIC,&now);
         if(diff_ns(next,now)>0)clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&next,NULL);else{st.deadline_misses++;next=now;}

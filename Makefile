@@ -2,7 +2,7 @@ CC ?= cc
 CPPFLAGS ?=
 CFLAGS ?= -O2 -std=gnu11 -Wall -Wextra -Wpedantic -Wformat=2 -Wshadow -Wstrict-prototypes -Wmissing-prototypes -Wundef
 LDFLAGS ?=
-LDLIBS ?= -lX11 -lm
+LDLIBS ?= -lX11 -lm -lcurl
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 
