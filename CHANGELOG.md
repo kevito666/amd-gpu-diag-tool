@@ -1,65 +1,62 @@
 # Changelog
 
-## 0.6.1
+## v0.7.0b — GitHub beta release candidate (2026-10-25)
 
-- Renamed to "AMD GPU Performance and Diagnostic Tool" across UI, docs, and install scripts.
-- Added version string to the window title bar.
-- Increased bar-graph font size for improved readability.
-- Added high-contrast text colors on light green and yellow bar segments.
-- Extended power bar range to 800W to accommodate heavy AI/ML workloads.
-- Added manual fan speed control (PWM percentage) to the Tuning page.
-- Added shader and memory clock max values to dashboard POWER/CLOCKS panel.
+- Added real AI and Gaming screenshots (latest AI performance log capture and original v0.7.0b Gaming capture); finalized GitHub release documentation and About-page credits.
+- Keep synthetic X11 smoke-test compilation unoptimized for timely CI; release application remains optimized.
 
-## 0.6.0
+### Second-pass stability and performance audit
 
-- Added guarded software tuning for firmware-exposed GFX clock/min-max or RDNA4 SCLK offset, memory max clock, VDDGFX offset, and board power cap.
-- Added an explicit ARM → APPLY write gate plus RESET STOCK and REFRESH controls.
-- Added green / amber / red aggressiveness zones relative to captured stock values and firmware-exported ranges.
-- Kept kernel/firmware ranges authoritative; the reference database never overrides driver limits.
-- Added prominent always-visible GPU thermal bars for every AMDGPU hwmon temperature channel and CPU package temperature when available.
-- Added detailed thermal critical/emergency values and power-cap ranges to the Power page.
-- Added a compiled-in 50-model desktop Radeon reference database spanning RX 400/500, Vega/Radeon VII, RX 5000, RX 6000, RX 7000, and RX 9000.
-- Added VRAM-aware matching for same-name capacity variants.
-- Added RDNA4 SCLK-offset support, including detection of the legacy pre-Linux-6.14 indexed representation.
-- Added RDNA1 maximum-clock support while deliberately leaving legacy Polaris/Vega10 multi-state voltage tables out of the modern slider model.
-- Added no new runtime library dependency.
+- Make policy target changes transactional with respect to driver write failures; preserve the existing watchdog target/lock state when a write is rejected.
+- Guard manual DPM clock selection and tuning reset against stale desired-policy state after rejected writes; note that multi-write driver sequences remain non-atomic.
+- Clear stale token-rate counters on AI-source change; refresh log discovery immediately after parser/path changes; clear prompt-cache history when log parsing is disabled.
+- Limit local HTTP downloads to the destination buffer instead of accumulating up to 1 MiB only to discard oversized responses.
+- Run expensive per-core sysfs CPU-frequency scans at two-second cadence, without slowing 500 ms CPU-load/temperature sampling.
+- Prevent the external log viewer from executing as root without a valid non-root sudo invoker.
+- Extend audit regressions; document the unresolved single-threaded watchdog scheduling risk in `docs/DEEP_AUDIT_2.md`.
 
+### Pre-release stabilization audit
 
-## 0.5.2
-
-- Added a built-in About page with developer, project, technology, development, and GPL information.
-- Added a dominant full-width board-power consumption bar to the always-visible hardware header.
-- Added the `I` keyboard shortcut and clickable About tab.
-- Expanded the window/header layout to keep the richer telemetry readable.
-- Kept the GUI plain Xlib and added no runtime dependencies.
+- Fix CPU fan PWM-max sensor descriptor leak and prevent mutation of the saved live sensor path.
+- Bound HTTP response allocation to 1 MiB; fix libcurl reused-handle header lifetime and reject truncated/invalid API bodies.
+- Replace repeated llama-server `ps|grep|awk` subprocess discovery with one cached `/proc` scan (15-second TTL); preserve arguments containing spaces and avoid printing model paths/API keys to debug logs.
+- Reject malformed numeric settings rather than silently converting them to option zero.
+- Replace top-process lifetime CPU-time ranking with true two-second CPU deltas and display activity percent.
+- Do not report inferred token throughput from experimental model-list/metrics API responses; clear stale live activity on missing llama API data.
+- Periodically refresh llama model metadata; drop supplementary groups before launching the user-facing log viewer.
+- Bound GPU/motherboard label formatting; add hardware-free audit regression tests and architecture notes.
 
 
-## 0.5.1
+- New persistent Settings view, replacing the full-width Help tab with Settings and a small `?` Help button.
+- Move AI API source choice to Settings (llama.cpp, Ollama, vLLM, LM Studio, heuristic).
+- Add log format selection and manually editable absolute log filename with automatic detection option. llama.cpp/Bionic timing parsing is implemented; alternative formats are explicitly experimental.
+- Add configurable compositor detector (auto, X11 owner, DRM client, process scan, off).
+- Enumerate available AMD DRM GPUs and allow on-demand rebinding in Settings. A switch pauses the watchdog and clears tuning locks/ARM; users must manually reactivate enforcement. Selection persists.
+- Add safe, nonfunctional overclock-unlock placeholder. There is no firmware unlocking or unsafe write behind it.
+- Simplify Power to measured electrical quantities, estimates labelled as such, electrical limits and policy; move temperature and clock details to Gaming.
+- Show session, X server, desktop, window manager and compositor package versions and build dates when available from Arch package metadata; show unknown when not available.
+- Show DRM-reported refresh rate, active modes and VRR state when exposed; VSync and buffering clearly shown as unverified because they are per-compositor/app and cannot be inferred reliably from X11 existence.
+- Events now shows up to 15 significant recent records, filtering high-frequency GFXOFF/DPM noise from the display; ring capacity expanded to 512.
+- Update project origin story, Tohoku attribution, and GPL license wording; adjust About layout so license is reachable by scrolling.
+- Refined Tuning action controls into the SAFETY/WORKFLOW tile as a compact 2×2 ARM/APPLY/RESET/REFRESH grid, reachable at the default window size.
+- New config persistence test, additional X11 screen smoke tests, GitHub Actions build gate, LICENSE, release notes, and source packaging.
 
-- Moved power-policy status and all eight power-mode controls to the top of the application.
-- Added always-visible GPU-load, VRAM, CPU-load, and system-RAM bar graphs.
-- Added an always-visible GPU-voltage bar.
-- Added current monitoring: real hwmon `curr*_input` when exposed, otherwise an explicitly labelled board-current estimate using `P / 12 V`.
-- Added 12 V equivalent-load resistance to the detailed Power page.
-- Added lightweight `/proc/stat` CPU utilization and `/proc/meminfo` RAM utilization sampling with no new library dependencies.
-- Increased the default window height slightly so the expanded hardware/control header does not crowd diagnostic pages.
-- Kept the GUI direct Xlib + libc only.
+### Beta limitations
 
-## 0.5.0
+- Hardware switching, policy writes and telemetry should be tested on real multi-GPU AMD configurations.
+- GPU switching does not undo any policy or prior firmware changes on the previously selected GPU; use RESET STOCK if necessary **before** switching.
+- Only llama.cpp/Bionic has detailed task-aware timing parsing; other parser selections are visible but experimental and do not claim metrics.
+- VSync, triple buffering, G-Sync compatibility and VRR state can be unreported or unavailable, depending on the running driver and compositor.
+- Package version/build dates are currently Arch/pacman oriented.
 
-- Replaced the terminal UI with a minimal native Xlib GUI.
-- Targeted X11/XLibre + XFCE as the primary desktop environment.
-- Added exact X server vendor detection.
-- Added authoritative X11 compositor detection using `_NET_WM_CM_S0`.
-- Added X11 window-manager detection.
-- Added clickable views, power modes, and common toggles.
-- Kept explicit keyboard shortcuts visible in the GUI.
-- Preserved the hardware summary, VRAM bar, per-process DRM attribution, GFXOFF diagnostics, event recorder, tracefs support, and watchdog behavior.
-- Retained `profile_standard` as the default power target.
-- Kept expensive DPM telemetry disabled by default.
-- Reduced GUI dependencies to direct `libX11` + libc only.
-- Cleaned path/string handling and strict compiler warnings.
+## v0.6.7
+- Consolidated Gaming power, temperature and memory tiles; added CPU clocks, PCIe link and actual BAR aperture diagnostics.
 
-## 0.4.x
+## v0.6.6
+- Prompt-history cache monitor for llama.cpp/Bionic host RAM, including save/load/eviction/rejection status.
 
-- Introduced the AMD GPU Diagnostic Tool dashboard and correlation diagnostics.
+## v0.6.5
+- Compact Tuning and 10 event rows; expanded AI performance log and GPU monitoring.
+
+## v0.6.4
+- Compact X11 UI overhaul.

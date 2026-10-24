@@ -1,205 +1,110 @@
 # AMD GPU Performance and Diagnostic Tool
 
-A lightweight X11/XLibre GUI for AMDGPU power-policy locking, performance monitoring, and diagnostics on Linux.
+**Version 0.7.0b (beta) · GPL-3.0-or-later · C / Xlib / AMDGPU · X11/XLibre**
 
-The application is written in C and uses plain Xlib for the interface. It intentionally avoids GTK, Qt, Electron, ncurses, libdrm, XCB as a direct dependency, and other GUI frameworks. The diagnostic core talks directly to Linux sysfs, procfs, debugfs, tracefs, and DRM fdinfo interfaces.
+What started as a coil-whine reducer and GPU power-state controller morphed into a full-blown AI and gaming desktop monitoring and configuration tool. Built in **Tohoku, Japan**.
 
-**Version:** 0.6.0  
-**License:** GPL-3.0-or-later
+A lightweight X11/XLibre-first diagnostics utility for Linux AMD GPUs. No GTK, Qt, Electron or Python runtime. Uses the kernel's sysfs, procfs, debugfs, tracefs and DRM fdinfo interfaces and an Xlib desktop UI. It currently requires root for its existing AMDGPU power-policy writes. **Review the code before running with sudo.**
 
-## Designed for
+## Screenshots — v0.7.0b running on AMD Radeon RX 7900 XTX
 
-This GUI build is intentionally X11/XLibre-first and is a particularly good fit for Arch Linux + XFCE. XLibre is detected from the running X server vendor string when available. The active X11 compositor is identified through the standard `_NET_WM_CM_S0` selection owner, which makes picom detection substantially more reliable than process-name guessing.
+These are unmodified captures of the actual compact X11 interface, not simulated mockups. Hardware and AI readings are momentary observations, not benchmark results.
 
-Wayland is not a target of this GUI build.
+| AI monitoring | Gaming monitoring |
+|:---:|:---:|
+| ![AI monitoring dashboard with llama.cpp activity, prompt-cache state and selected NVMe device I/O](docs/screenshots/ai.png) | ![Gaming monitoring dashboard showing GPU thermals, CPU clocks, PCIe/BAR status, and hardware statistics](docs/screenshots/gaming.png) |
 
-## Features
+The **AI** screenshot shows task-specific prompt/decode timing entries and the selected NVMe monitoring tile. The dashboard supports llama.cpp/Bionic timing logs and selectable Project Maya log parsing. **AI NVMe CACHE I/O** measures aggregate I/O on the selected NVMe namespace; it cannot identify which requests or processes generated the disk traffic. The **Gaming** dashboard reports AMDGPU and Linux hardware telemetry, not game-rendered FPS unless a real frame source is connected.
 
-- AMDGPU power-policy watchdog with `profile_standard` as the default target.
-- Adaptive correction: low-overhead steady polling with a short faster burst after an actual policy reset.
-- Prominent top-of-window power-mode selector with clickable modes and keyboard shortcuts.
-- A dominant full-width board-power bar, a prominent multi-sensor thermal strip, and always-visible bars for GPU load, VRAM, CPU load, system RAM, GPU voltage, and current.
-- Live temperature, fan RPM/percentage, board power, GFX clock, and memory clock.
-- Uses a real hwmon current sensor when available; otherwise shows an explicitly labelled 12 V board-current estimate from `board_power / 12 V`.
-- Per-process DRM activity attribution.
-- GFXOFF monitoring.
-- Power-profile, PCIe, KMS, connector, plane, and display diagnostics.
-- Exact X11 compositor-owner detection plus window-manager identification.
-- Diagnostic event flight recorder and optional CSV logging.
-- Optional isolated tracefs diagnostics.
-- Manual GFX/MEM DPM-level cycling.
-- Guarded software tuning page for firmware-exposed GFX clocks/offsets, memory clocks, VDDGFX offset, and board power cap.
-- Two-step ARM → APPLY write gate plus RESET STOCK and REFRESH controls.
-- Green / amber / red aggressiveness zones based on captured stock values and firmware ranges; colors are not a hardware-safety guarantee.
-- Embedded reference database covering 50 desktop Radeon models from RX 400/500 and Vega through RX 5000/6000/7000/9000.
-- Event-driven Xlib GUI with no animation/render loop.
+## Build and run (Arch Linux / X11)
 
-## Runtime footprint
+Install a C compiler, `make`, X11 headers, libcurl development headers and X11 runtime. To build:
 
-The executable directly links to:
-
-- `libX11`
-- `libm` (part of glibc on Arch Linux)
-- `libc`
-
-Xlib brings its normal X11 transport dependencies indirectly. No GTK, Qt, Electron, libdrm, Python runtime, or other GUI toolkit is required. Runtime size varies slightly by compiler/toolchain.
-
-## Arch Linux requirements
-
-On XFCE/XLibre you will almost certainly already have `libx11` installed.
-
-```bash
-sudo pacman -S --needed base-devel libx11
-```
-
-No GTK or Qt packages are required.
-
-## Tuning controls
-
-The **Tuning** page uses Linux AMDGPU interfaces directly. It does not replace the driver or firmware safety mechanisms.
-
-The program treats the ranges exported by `pp_od_clk_voltage` and `power1_cap_min` / `power1_cap_max` as the absolute write boundaries. The embedded GPU database supplies reference boost/game clocks, board power, memory configuration, and architecture context only.
-
-The color bands mean:
-
-- **green** — at or below the captured stock/reference operating point
-- **amber** — above stock but not near the exported firmware ceiling
-- **red** — aggressive setting near the top of the exported driver/firmware range
-
-These colors are an aggressiveness guide, **not a guarantee that a setting is stable, thermally safe, or safe for every partner board**.
-
-Writes are deliberately two-step: click **ARM WRITES**, then **APPLY**. The application disarms writes immediately after an apply attempt. **RESET STOCK** asks the AMDGPU overdrive interface to reset and restores the power cap captured at startup.
-
-Older multi-state Polaris/Vega10 overdrive tables are not forced into the modern min/max slider model. They remain read-only in this page unless a control can be represented unambiguously; power-cap controls still appear when the driver exposes them.
-
-See [`docs/GPU_DATABASE.md`](docs/GPU_DATABASE.md) for database scope and provenance.
-
-## Build
-
-```bash
+```sh
 make
-make check
+make check check-config check-parser check-pcie check-audit check-maya-nvme check-ui
+sudo make install
+sudo -E /usr/local/bin/amd-gpu-diagnostic
 ```
 
-## Run
+The visual smoke tests need `xvfb-run` and `xauth`. Running the program without root is not supported for GPU power-policy tuning. `--version` and `--help` work without root. `--card N` chooses a DRM card on startup and overrides the saved preference for that invocation.
 
-AMDGPU power-policy controls normally require root. Preserve the X11 display/authentication environment when using sudo:
+## Screens and actions
 
-```bash
-sudo -E ./amd-gpu-diagnostic
-```
+- **AI / GAMING** workflow buttons select the main dashboard.
+- **Settings** contains AI token/API/Project Maya log source, AI log parser, Auto/Manual log detection with an editable absolute filename, a saved AI NVMe device selector, compositor source, detected AMD card selector and an inert overclock unlock placeholder.
+- **Power** contains power, voltage, current, power caps, equivalent load estimates, power profile and policy. GPU thermals, clocks and VRR are under Gaming/Desktop.
+- **Tuning** has compact 3×2 tiles, firmware-range labels, and a 2×2 ARM/APPLY/RESET/REFRESH group inside the safety tile. RESET STOCK is available; do not confuse colored zones with safety certification.
+- **Desktop** reports session, X server, desktop, window manager, compositor, their installed Arch package versions and package build dates where known, plus DRM modes/refresh/VRR and explicitly unverified VSync/buffering.
+- **Events** shows the 15 most recent significant events it still retains, leaving high-frequency GFXOFF/DPM changes out of that *view*. CSV events are unaffected.
+- The square **?** opens keyboard and mouse help. **About** contains origin, license and development credits.
 
-If your sudo configuration does not preserve X11 authentication:
+### Settings and privilege boundary
 
-```bash
-sudo env DISPLAY="$DISPLAY" XAUTHORITY="$XAUTHORITY" ./amd-gpu-diagnostic
-```
+Settings persist in `~/.config/amd-gpu-diagnostic/settings.ini` in the **invoking user's** home directory (when started through sudo). Changes are saved atomically by dropping privileges before writing a mode-0600 file. The settings file is local, plain-text, and can be copied between systems; it is not a tuning profile. Editing the log filename accepts a typed absolute path; Enter saves; Esc cancels.
 
-The application deliberately lowers its process priority by default so audio and game workloads receive scheduling preference.
+Settings changes do not require a restart. After choosing another AMD card, click **APPLY GPU**. The app opens the new device first, then pauses policy enforcement, clears clock locks and tuning ARM state, and rebinds telemetry. It **does not restore the old GPU's pre-existing policy**. It will not automatically enable the watchdog on the newly selected GPU. Do not switch during an active dangerous tuning session.
 
-## Main GUI
+### Project Maya + AI NVMe monitoring (pre-beta addition)
 
-The top control/status block keeps power control and physical system state visible on every page:
+The AI dashboard includes a compact **AI NVMe CACHE I/O** tile showing read and write
+rates (MiB/s), observed peaks, and approximate device busy percentage from Linux
+`/sys/block/nvmeXnY/stat`. Settings > **AI NVME CACHE SSD** cycles detected NVMe
+namespaces and shows the kernel's model label. The chosen namespace (e.g. `nvme0n1`)
+is saved in the invoking user's `settings.ini` as `ai_nvme_device`. An invalid or missing
+device is shown as unavailable, never silently substituted for a different saved device.
 
-- full GPU name
-- all AMDGPU temperature channels exposed by hwmon (typically edge, junction/hotspot, and memory) plus CPU package temperature when available
-- DRM card / PCI address / PCI ID
-- total VRAM
-- requested vs actual AMDGPU policy and the eight power-mode buttons
-- temperature, fan RPM/percentage, and board power
-- GFX and memory clocks
-- GPU-load and VRAM-usage bars
-- CPU-load and system-RAM bars
-- measured GPU voltage bar
-- current bar: hardware current sensor when available, otherwise a labelled `P/12 V` board-current estimate
+**The readings count all I/O on that NVMe namespace, not exclusively Project Maya/DeepSeek
+model traffic.** Sampling is approximately every 0.5 seconds, using monotonic elapsed time;
+peaks reset upon changing drives or a counter reset. This is a monitoring-only feature;
+there is no SSD writes, tuning, stress test, or hardware setting change.
 
-The Home view summarizes one or two important facts from every detailed page rather than duplicating all diagnostic data.
+Project Maya produces `maya-<model>.log` beside its model configuration. Select **Project
+Maya (log)** for both AI DATA SOURCE and AI LOG PARSER, then choose the log path manually,
+or leave discovery set to Auto for supported locations: `~/src/project-maya`,
+`~/project-maya`, or `~/Downloads/project-maya`. Project Maya's verified GLM engine
+log entries include `glm stat:`, `glm prefill:`, `glm fast:` and `glm split`.
+The parser also retains `ds4`-prefixed engine lines without pretending a different
+format is compatible. The dashboard shows last reported decode rate, prefill rate
+when explicitly available, VRAM expert hit %, RAM fetches per token and SSD reads/
+wait time per token when logged. Values are completed log summaries, **not live
+per-token measurements**. Missing metrics are labeled unavailable, not inferred.
 
-## Power modes
+If Project Maya uses an unusual custom location or log naming, use the **manual absolute
+log path** setting. For troubleshooting, the engine log is typically named
+`maya-<model>.log` in the Project Maya root. Project Maya supports model
+expert tiers spanning GPU VRAM, system RAM and NVMe; the filesystem I/O monitor is
+independent of its log parser. Upstream reference:
+[Project Maya](https://github.com/mw00/project-maya).
 
-The power-mode buttons are always visible near the top of the window, immediately below the target/actual power-policy status:
+### AI parser notes
 
-- `1` Auto
-- `2` Low
-- `3` High
-- `4` Standard (`profile_standard`)
-- `5` Min-GFX
-- `6` Min-MEM
-- `7` Peak
-- `8` Manual
+The llama.cpp/Bionic task-aware parser is fully implemented, including prompt/eval rates and host-RAM prompt cache messages from a 512 KiB log tail. Other log parser modes are **experimental placeholders**: users can select them, but task timing is not synthesized from unrelated log formats. Ollama/vLLM/LM Studio API token-source detection remains separate from log-file parsing. Prompt cache occupancy is an event-based *last-reported* value, not a sampled RSS reading. The 24 GiB Bionic host cache is separate from GPU VRAM.
 
-`profile_standard` is the default.
+### Desktop diagnostics notes
 
-## Views and controls
+Version and **package build dates** come from local `/var/lib/pacman/local/*/desc` metadata, not a binary compile timestamp. On unsupported distributions the dates may show *unknown*. Display refresh is read from reported DRM CRTC state when debugfs access permits. DRM `vrr_enabled` describes the current kernel-reported state if exposed; it does not verify per-game frame pacing. **VSync/number of buffers cannot be reliably inferred from the compositor process, so they are marked unverified.**
 
-- `0` Home
-- `P` GPU clients
-- `G` Power / DPM
-- `W` X11 / desktop / display
-- `E` diagnostic events
-- `R` kernel trace
-- `H` help
-- `I` About
-- `Space` pause/resume watchdog
-- `A` adaptive correction burst
-- `C` DPM clock telemetry
-- `+` / `-` watchdog rate
-- `D` DPM telemetry rate
-- `S` cycle manual GFX DPM level
-- `M` cycle manual memory DPM level
-- `X` clear manual clock locks
-- `T` tracefs on/off
-- `L` CSV logging on/off
-- `Q` quit
+### Known issues / before tagging the beta
 
-The main tabs, power modes, watchdog, adaptive mode, DPM telemetry, trace, and CSV log toggles are clickable.
+- Validate on your RX 7900 XTX with picom/XFCE/XLibre, including the Settings screen's GPU selection and custom Bionic log path.
+- Validate a second AMD GPU, if possible, and test the pause/re-arm behavior during switching.
+- The code has been built under strict `-Werror` and tested against synthetic X11 telemetry; this does not guarantee safe hardware write behavior across drivers.
+- The overclock unlock feature does nothing in this beta by design.
 
-## Sampling design
 
-The program deliberately separates inexpensive enforcement from expensive telemetry:
+## v0.7.0b stabilization audit
 
-- Power-policy watchdog: 5 ms / 200 Hz by default.
-- Adaptive correction burst: 500 us / 2 kHz for 250 ms after a real mismatch.
-- Basic GPU hardware telemetry: 10 Hz.
-- CPU/RAM telemetry: 2 Hz.
-- Per-process DRM accounting: 1 Hz.
-- Desktop/display discovery: 0.1 Hz.
-- Expensive `pp_dpm_*` sampling: off by default.
-- Kernel tracing: off by default.
-- GUI redraw: at most 4 Hz and only when dirty.
+Before the GitHub beta tag, this source package received a correctness and performance pass. The main fixes are: CPU fan file-descriptor/path handling, libcurl authentication lifetime and bounded response buffering, cached `/proc`-based llama-server discovery, strict integer settings parsing, real interval CPU-process activity, and removal of stale/unverified AI rate and debug output. See [`docs/AUDIT_AND_ARCHITECTURE.md`](docs/AUDIT_AND_ARCHITECTURE.md) for tests, architecture and remaining limitations. The current window/tile organization and tuning safeguards are unchanged.
 
-This design exists partly because very aggressive amdgpu sysfs polling can cause scheduling latency and audio xruns even when average CPU utilization appears modest.
-
-## XLibre / picom diagnostics
-
-The Desktop page uses Xlib to query the live server directly:
-
-- `ServerVendor()` identifies XLibre when the running server reports it.
-- `_NET_WM_CM_S0` identifies the active compositor selection owner.
-- `_NET_WM_PID` maps that owner back to its process (for example picom).
-- `_NET_SUPPORTING_WM_CHECK` identifies the window manager (for example Xfwm4).
-
-Process scanning remains as a fallback for diagnostic context.
-
-## Security
-
-This program writes privileged AMDGPU sysfs controls and currently runs the GUI process as root. X11 is not a privilege-separated display protocol, so this version is intended for a trusted, local, single-user desktop session. Do not expose the X server to untrusted clients.
-
-A future split privileged helper / unprivileged GUI is possible, but it would add IPC and lifecycle complexity. This release favors the smallest practical implementation for a trusted workstation.
+This tarball has a **flat project-root layout** for updating your existing checkout directly. Your previous builds remain in `archive/`, which is excluded from Git. The screenshots above are genuine v0.7.0b captures; they show actual device readings, not synthetic performance claims.
 
 ## License
 
-GNU General Public License version 3 or later (`GPL-3.0-or-later`). See `LICENSE`.
+Copyright (C) 2026 Kevin Kolasa. Source and redistribution under **GPL-3.0-or-later**. Full text in `LICENSE`.
 
+### Second-pass pre-release audit
 
-## About
+The v0.7.0b source includes a second-pass stability audit, regression tests, and hardware testing checklist in [`docs/DEEP_AUDIT_2.md`](docs/DEEP_AUDIT_2.md). In particular, watchdog enforcement and synchronous telemetry share one event loop: configured microsecond intervals are desired sampling intervals, **not hard real-time guarantees**.
 
-**Developer:** Kevin  
-**Copyright:** © 2026 Kevin Kolasa  
-**Developed in:** Akita City, Akita Prefecture, Japan
-
-AMD GPU Performance and Diagnostic Tool grew from the practical need to understand Linux AMDGPU power-state switching, desktop/game rendering interactions, and associated coil-whine behavior.
-
-The project prioritizes low overhead, simple native C, transparent Linux kernel interfaces, and minimal dependencies. Project direction, hardware testing, and technical decisions remain under direct developer review. AI-assisted development tools are used to accelerate implementation, testing, review, and documentation.
-
-**License:** GPL-3.0-or-later
+For GitHub release assets, the source package contains a flat root layout; extract into an existing checkout only after backing up local changes. The X11 UI test harness compiles without optimization to keep headless CI responsive; the production binary uses the standard optimized build flags.

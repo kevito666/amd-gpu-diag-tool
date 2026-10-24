@@ -25,9 +25,12 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/resource.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include <libgen.h>
+#include <pwd.h>
+#include <grp.h>
 
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
@@ -39,7 +42,7 @@
 
 #include "gpu_specs.h"
 
-#define VERSION "0.6.1"
+#define VERSION "0.7.0b"
 #define MAX_PATH_LEN 512
 #define MAX_TEXT 4096
 #define MAX_LEVELS 32
@@ -63,7 +66,7 @@
 #define CURRENT_BAR_MAX_A 50.0
 #define POWER_BAR_MAX_W 800.0
 #define MAX_GPU_CLIENTS 128
-#define MAX_DIAG_EVENTS 96
+#define MAX_DIAG_EVENTS 512
 #define MAX_TRACE_LINE 512
 #define MAX_CONNECTORS 12
 #define MAX_GPU_TEMPS 3
@@ -144,6 +147,7 @@ typedef struct {
     char power_profile_path[MAX_PATH_LEN];
     char pcie_bw_path[MAX_PATH_LEN];
     char gpu_metrics_path[MAX_PATH_LEN];
+    char gpu_base[MAX_PATH_LEN];
     char debugfs_dir[MAX_PATH_LEN];
     char gfxoff_path[MAX_PATH_LEN];
     char gfxoff_status_path[MAX_PATH_LEN];
@@ -191,6 +195,7 @@ typedef enum {
     VIEW_DESKTOP,
     VIEW_EVENTS,
     VIEW_TRACE,
+    VIEW_SETTINGS,
     VIEW_HELP,
     VIEW_ABOUT
 } View;
@@ -227,6 +232,20 @@ typedef struct {
 
 typedef struct {
     char session_type[32];
+    char session_version[96];
+    char session_built[32];
+    char desktop_version[96];
+    char desktop_built[32];
+    char xserver_version[96];
+    char xserver_built[32];
+    char wm_version[96];
+    char wm_built[32];
+    char compositor_version[96];
+    char compositor_built[32];
+    char refresh[96];
+    char vrr_state[80];
+    char vsync_state[80];
+    char buffer_state[80];
     char desktop[96];
     char compositor[64];
     pid_t compositor_pid;
@@ -267,8 +286,20 @@ typedef struct {
     char freq1_label[32];
     char freq2_label[32];
     unsigned long long vram_used;
+    bool vram_usage_valid;
     char power_profile[192];
     char pcie_bw[192];
+    /* Hardware PCIe link state, read from the selected GPU PCI sysfs device. */
+    char pcie_current_speed[48];
+    char pcie_max_speed[48];
+    int pcie_current_width;
+    int pcie_max_width;
+    bool pcie_link_valid;
+    bool bar0_valid;
+    uint64_t bar0_bytes;
+    bool rebar_supported;  /* presence of resource0_resize: capability, not active size */
+    int pcie_link_loaded_low;  /* -1 unknown, 0 OK/idle, 1 low under load */
+    int amdgpu_dpm; /* -2 unknown, -1 firmware auto, 0 disabled, 1 enabled */
     bool gpu_metrics_present;
     int gpu_metrics_format;
     int gpu_metrics_content;
@@ -284,23 +315,6 @@ typedef enum {
     WORKFLOW_AI = 0,
     WORKFLOW_GAMING
 } WorkflowMode;
-
-/* Frametime tracking for gaming mode */
-#define FRAMETIME_HISTORY_SIZE 300
-#define FRAMETIME_WINDOW_MAX_S 60
-
-typedef struct {
-    double times_ms[FRAMETIME_HISTORY_SIZE];
-    int count;
-    int head;
-    double window_s;  /* Time window for percentile calculations */
-    double avg_ms;
-    double p1_ms;
-    double p01_ms;
-    double p001_ms;
-    double max_ms;
-    double min_ms;
-} FrametimeStats;
 
 /* CPU per-core load */
 #define MAX_CPU_CORES 128
@@ -323,7 +337,10 @@ typedef enum {
     TOKEN_SOURCE_HEURISTIC = 0,
     TOKEN_SOURCE_LLAMA,
     TOKEN_SOURCE_OLLAMA,
-    TOKEN_SOURCE_VLLM
+    TOKEN_SOURCE_VLLM,
+    TOKEN_SOURCE_LMSTUDIO,
+    TOKEN_SOURCE_MAYA, /* engine log, no API polling */
+    TOKEN_SOURCE_COUNT
 } TokenSource;
 
 typedef struct {
@@ -333,6 +350,10 @@ typedef struct {
     int64_t prompt_tokens;
     int64_t eval_tokens;
     bool has_data;
+    bool is_processing;
+    /* Prevent counters from one backend being reused by another. */
+    bool source_initialized;
+    TokenSource source_in_use;
     char source_label[32];
     /* Heuristic state */
     double power_history[100];
@@ -341,8 +362,31 @@ typedef struct {
     bool in_decode_phase;
     double decode_power_w;
     /* API state */
-    time_t last_api_poll;
+    struct timespec last_api_poll;
+    int64_t prev_decoded;
+    int64_t n_prompt_tokens;
+    int64_t n_prompt_tokens_processed;
+    int64_t n_prompt_tokens_cache;
 } TokenRate;
+
+/* Host-RAM prompt-state cache from llama.cpp/Bionic's --cache-ram.
+ * These are NOT GPU VRAM, GPU KV-cache or system-RSS measurements.
+ * Usage is reported only when the backend logs an actual cache-state summary. */
+typedef struct {
+    bool usage_valid;
+    bool limit_valid;
+    double used_mib;
+    double limit_mib;   /* 0 = disabled; -1 = unlimited */
+    int entries;
+    int save_attempts;
+    int matches;       /* f_keep matches; not proof that a load succeeded */
+    int evictions;
+    int rejected;
+    int load_failures;
+    int forced_reprocess;
+    double evicted_mib;
+    double last_rejected_mib;
+} AiPromptCache;
 
 typedef struct {
     double cpu_pct;
@@ -354,6 +398,10 @@ typedef struct {
     unsigned long long prev_cpu_idle;
     bool have_cpu_sample;
     int fd_cpu_temp;
+    int fd_cpu_tctl;
+    char cpu_tctl_path[MAX_PATH_LEN];
+    char cpu_tctl_label[48];
+    double cpu_tctl_c;
     char cpu_temp_path[MAX_PATH_LEN];
     char cpu_temp_label[32];
     double cpu_temp_c;
@@ -401,12 +449,64 @@ typedef struct {
     bool llama_available;
     bool ollama_available;
     bool vllm_available;
+    bool lmstudio_available;
 
     /* Gaming mode metrics */
-    FrametimeStats frametimes;
     CpuCoreLoad cpu_cores;
-    double input_latency_ms;
+    double cpu_clock_min_mhz, cpu_clock_avg_mhz, cpu_clock_max_mhz;
+    double cpu_clock_cap_mhz;
+    int cpu_clock_count;
+    struct timespec last_cpu_clock_scan;
+    int cpu_boost; /* -1 unknown, 0 disabled, 1 enabled */
+    char cpu_governor[32];
+    int cpu_smt; /* -1 unknown, otherwise actual online SMT state */
+
+    /* AI log events */
+    char ai_log_path[MAX_PATH_LEN];
+    char ai_log_source[32];
+    int ai_log_event_count;
+    time_t ai_log_last_update;
+    time_t ai_log_last_detect;
+
+    /* AI model info */
+    char ai_model_name[128];
+    char ai_model_type[32];
+    int ai_ctx_size;
+    char ai_cache_type_k[16];
+    char ai_cache_type_v[16];
+    bool ai_flash_attn;
+    bool ai_mtp;
+    AiPromptCache ai_prompt_cache;
+    /* Prefer the currently running server's setting over old log lines. */
+    bool ai_cache_process_limit_valid;
+    double ai_cache_process_limit_mib;
+    time_t ai_cache_process_last_check;
+    bool ai_model_info_valid;
+    char ai_model_activity[32];  /* "Idle", "Reading", "Thinking", "Outputting" */
 } SystemTelemetry;
+
+typedef struct {
+    time_t timestamp;
+    char time_str[16];
+    double prompt_eval_ms;
+    double prompt_tokens;
+    double prompt_ms_per_token;
+    double prompt_tps;
+    double eval_ms;
+    double eval_tokens;
+    double eval_ms_per_token;
+    double eval_tps;
+    double total_ms;
+    double total_tokens;
+    int slot_id;
+    int task_id;
+    bool has_prompt;
+    bool has_eval;
+    bool has_total;
+} AiLogEvent;
+
+#define AI_LOG_MAX_EVENTS 12
+static AiLogEvent g_ai_log_events[AI_LOG_MAX_EVENTS];
 
 typedef enum {
     TUNE_ZONE_SAFE = 0,
@@ -509,7 +609,71 @@ typedef struct {
 
 static volatile sig_atomic_t g_stop = 0;
 static WorkflowMode g_workflow = WORKFLOW_AI;
-static TokenSource g_token_source = TOKEN_SOURCE_HEURISTIC;
+static TokenSource g_token_source = TOKEN_SOURCE_LLAMA;
+static char g_ai_log_path[MAX_PATH_LEN] = {0};
+/* Settings are persisted for the *invoking desktop user*, never /root with sudo. */
+typedef enum { LOG_AUTO, LOG_LLAMA, LOG_BIONIC, LOG_OLLAMA, LOG_VLLM, LOG_LMSTUDIO, LOG_OFF, LOG_MAYA, LOG_COUNT } LogParser;
+typedef enum { COMP_AUTO, COMP_X11, COMP_DRM, COMP_PROCESS, COMP_OFF, COMP_COUNT } CompositorSource;
+typedef struct {
+    TokenSource token_source;
+    LogParser log_parser;
+    CompositorSource compositor_source;
+    bool ai_log_manual;
+    char ai_log_file[MAX_PATH_LEN];
+    int preferred_card;
+    char ai_nvme_device[32]; /* selected NVMe namespace, e.g. nvme0n1 */
+} AppSettings;
+static AppSettings g_settings = {.token_source=TOKEN_SOURCE_LLAMA,.log_parser=LOG_AUTO,
+                                 .compositor_source=COMP_AUTO,.preferred_card=-1};
+static const char *const g_parser_names[]={"Auto (llama compatible)","llama.cpp","Bionic / llama.cpp",
+    "Ollama (experimental)","vLLM (experimental)","LM Studio (experimental)","Disabled",
+    "Project Maya (engine log)"};
+/* Read-only aggregate block-device throughput. Linux /sys/block/DEVICE/stat counts
+ * 512-byte sectors regardless of the drive's advertised logical sector size.
+ * It includes ALL host I/O, not exclusively inference traffic. */
+typedef struct {
+    char name[32];
+    char model[96];
+} NvmeDevice;
+typedef struct {
+    NvmeDevice devices[24];
+    int device_count;
+    char selected[32];
+    bool have_prev, valid;
+    uint64_t prev_read_sectors, prev_write_sectors, prev_busy_ms;
+    struct timespec prev_time;
+    double read_mib_s, write_mib_s, peak_read_mib_s, peak_write_mib_s, busy_pct;
+    time_t last_discover;
+} NvmeMonitor;
+static NvmeMonitor g_nvme;
+
+/* Project Maya writes maya-<model>.log beside its model's .json config.
+ * Engine lines vary by version and backend: raw provenance is retained.
+ * Speeds are populated only from explicit known 'tokens in milliseconds'
+ * prefill entries, never inferred from unrelated statistic lines. */
+typedef struct {
+    char recent[3][160];
+    int count;
+    unsigned long recognized;
+    bool prefill_valid;
+    double prefill_tps;
+    long prompt_tokens;
+    bool decode_valid;
+    double decode_tps, decode_ms_per_tok;
+    bool vram_hit_valid, disk_valid, ram_fetch_valid;
+    double vram_hit_pct, disk_reads_per_token, disk_wait_ms_per_token;
+    double ram_fetches_per_token;
+} MayaLogMonitor;
+static MayaLogMonitor g_maya;
+
+static const char *const g_compositor_names[]={"Auto", "X11 selection", "DRM client", "Process scan", "Disabled"};
+static int g_requested_gpu=-1;
+static bool g_gpu_switch_requested=false;
+static Gpu g_gpu_inventory[16];
+static int g_gpu_inventory_count=0;
+static bool g_edit_ai_path=false;
+static char g_edit_path_buffer[MAX_PATH_LEN]={0};
+
 
 static const char *POLICIES[] = {
     "auto",
@@ -599,18 +763,39 @@ static int read_path_text(const char *path, char *buf, size_t cap) {
 }
 
 /* HTTP GET using libcurl */
+/* Bound local API responses: a runaway /metrics endpoint must not grow this
+ * root-owned GUI indefinitely. CURL_WRITEFUNC_ERROR is signalled by 0 bytes. */
+#define HTTP_MAX_RESPONSE (1024u * 1024u)
+/* Do not download 1 MiB just to reject it for a 4 KiB caller buffer.
+ * The bounded writer fails the transfer immediately at the usable size. */
+static size_t http_response_limit(size_t caller_capacity) {
+    if (caller_capacity < 2) return 0;
+    return caller_capacity - 1 < HTTP_MAX_RESPONSE ? caller_capacity - 1 : HTTP_MAX_RESPONSE;
+}
 struct http_buf {
     char *data;
     size_t size;
+    size_t capacity;
+    size_t limit;
 };
 
 static size_t http_write_cb(void *ptr, size_t size, size_t nmemb, void *userdata) {
     struct http_buf *buf = userdata;
+    if (!buf || (size && nmemb > SIZE_MAX / size)) return 0;
     size_t total = size * nmemb;
-    if (buf->size + total + 1 > buf->size * 2) {
-        buf->size = (buf->size + total + 1) * 2;
-        buf->data = realloc(buf->data, buf->size);
-        if (!buf->data) return 0;
+    if (!total) return 0;
+    if (buf->size > buf->limit || total > buf->limit - buf->size) return 0;
+    size_t required = buf->size + total + 1;
+    if (required > buf->capacity) {
+        size_t next_cap = buf->capacity ? buf->capacity : 1024;
+        while (next_cap < required) {
+            if (next_cap > (buf->limit + 1) / 2) { next_cap = buf->limit + 1; break; }
+            next_cap *= 2;
+        }
+        char *next = realloc(buf->data, next_cap);
+        if (!next) return 0;  /* Never lose ownership of the original allocation. */
+        buf->data = next;
+        buf->capacity = next_cap;
     }
     memcpy(buf->data + buf->size, ptr, total);
     buf->size += total;
@@ -618,29 +803,174 @@ static size_t http_write_cb(void *ptr, size_t size, size_t nmemb, void *userdata
     return total;
 }
 
-static int http_get(const char *url, char *out, size_t cap, int timeout_ms) {
-    CURL *curl = curl_easy_init();
+/* Configuration is intentionally simple, version tolerant and uses no shell execution. */
+static const char *settings_user_home(void) {
+#ifdef AMD_GPU_DIAG_TEST
+    const char *override=getenv("AMD_GPU_DIAG_TEST_HOME");
+    if (override && *override) return override;
+#endif
+    const char *su=getenv("SUDO_UID");
+    if (geteuid()==0 && su && *su) {
+        char *end=NULL; errno=0;
+        unsigned long n=strtoul(su,&end,10);
+        if (!errno && end && !*end && n<=UINT32_MAX) {
+            struct passwd *pw=getpwuid((uid_t)n);
+            if (pw && pw->pw_dir) return pw->pw_dir;
+        }
+    }
+    struct passwd *pw=getpwuid(getuid());
+    return pw && pw->pw_dir ? pw->pw_dir : getenv("HOME");
+}
+static bool settings_paths(char *folder, size_t fc, char *file, size_t pc) {
+    const char *home=settings_user_home();
+    if (!home || !*home || snprintf(folder,fc,"%s/.config/amd-gpu-diagnostic",home)>=(int)fc) return false;
+    return snprintf(file,pc,"%s/settings.ini",folder)<(int)pc;
+}
+/* Reject malformed, negative, overflowed and fractional enum config values.
+ * atoi() silently turns a corrupted config line into option zero. */
+static bool settings_int_in_range(const char *value, int min, int max, int *out) {
+    if (!value || !*value || isspace((unsigned char)*value)) return false;
+    errno = 0;
+    char *end = NULL;
+    long v = strtol(value, &end, 10);
+    if (errno || end == value || *end || v < min || v > max) return false;
+    *out = (int)v;
+    return true;
+}
+
+static void settings_load(void) {
+    char folder[MAX_PATH_LEN],file[MAX_PATH_LEN];
+    if (!settings_paths(folder,sizeof(folder),file,sizeof(file))) return;
+    FILE *f=fopen(file,"r");
+    if (!f) return;
+    char line[1024];
+    while(fgets(line,sizeof(line),f)) {
+        trim(line);
+        char *eq=strchr(line,'='); if(!eq) continue;
+        *eq++=0;
+        if(!strcmp(line,"token_source")) {
+            int n; if(settings_int_in_range(eq,0,TOKEN_SOURCE_COUNT-1,&n)) g_settings.token_source=(TokenSource)n;
+        } else if(!strcmp(line,"log_parser")) {
+            int n; if(settings_int_in_range(eq,0,LOG_COUNT-1,&n)) g_settings.log_parser=(LogParser)n;
+        } else if(!strcmp(line,"compositor_source")) {
+            int n; if(settings_int_in_range(eq,0,COMP_COUNT-1,&n)) g_settings.compositor_source=(CompositorSource)n;
+        } else if(!strcmp(line,"ai_log_manual")) g_settings.ai_log_manual=!strcmp(eq,"1");
+        else if(!strcmp(line,"ai_log_file") && eq[0]=='/' && !strchr(eq,'\n') &&
+                strlen(eq)<sizeof(g_settings.ai_log_file)) text_copy(g_settings.ai_log_file,sizeof(g_settings.ai_log_file),eq);
+        else if(!strcmp(line,"ai_nvme_device") && strlen(eq)<sizeof(g_settings.ai_nvme_device)) {
+            /* Store only a kernel-provided device basename, never an arbitrary path. */
+            bool safe = !strncmp(eq,"nvme",4);
+            for(const unsigned char *q=(const unsigned char*)eq; *q; ++q)
+                if(!isalnum(*q)) safe=false;
+            if(safe) text_copy(g_settings.ai_nvme_device,sizeof(g_settings.ai_nvme_device),eq);
+        }
+        else if(!strcmp(line,"preferred_card")) {
+            int n; if(settings_int_in_range(eq,-1,255,&n)) g_settings.preferred_card=n;
+        }
+    }
+    fclose(f);
+    g_token_source=g_settings.token_source;
+}
+static bool settings_save(void) {
+    char folder[MAX_PATH_LEN],file[MAX_PATH_LEN];
+    if (!settings_paths(folder,sizeof(folder),file,sizeof(file))) return false;
+    /* A root-run diagnostic must never leave root-owned configuration files in HOME.
+     * Fork, drop privileges first, then create/write atomically as the desktop user. */
+    pid_t pid=fork();
+    if(pid<0) return false;
+    if(pid==0) {
+        const char *su=getenv("SUDO_UID"),*sg=getenv("SUDO_GID");
+        if(geteuid()==0 && su && sg) {
+            char *e1=NULL,*e2=NULL;
+            unsigned long uid=strtoul(su,&e1,10),gid=strtoul(sg,&e2,10);
+            if(!e1||*e1||!e2||*e2||uid>UINT32_MAX||gid>UINT32_MAX ||
+               setgroups(0,NULL)!=0 || setgid((gid_t)gid)!=0 || setuid((uid_t)uid)!=0) _exit(2);
+        }
+        char config[MAX_PATH_LEN];
+        const char *home=settings_user_home();
+        /* After privilege drop, resolve the user's own HOME again. */
+        if(!home || snprintf(config,sizeof(config),"%s/.config",home)>=(int)sizeof(config)) _exit(2);
+        if(mkdir(config,0700)!=0 && errno!=EEXIST) _exit(2);
+        if(mkdir(folder,0700)!=0 && errno!=EEXIST) _exit(2);
+        char tmp[MAX_PATH_LEN];
+        if(snprintf(tmp,sizeof(tmp),"%s/.settings-XXXXXX",folder)>=(int)sizeof(tmp)) _exit(2);
+        int fd=mkstemp(tmp);
+        if(fd<0) _exit(2);
+        (void)fchmod(fd,0600);
+        FILE *f=fdopen(fd,"w");
+        if(!f) {close(fd);unlink(tmp);_exit(2);}
+        fprintf(f,"# amd-gpu-diagnostic v0.7 configuration\n");
+        fprintf(f,"token_source=%d\nlog_parser=%d\ncompositor_source=%d\n",(int)g_settings.token_source,
+                (int)g_settings.log_parser,(int)g_settings.compositor_source);
+        fprintf(f,"ai_log_manual=%d\nai_log_file=%s\npreferred_card=%d\nai_nvme_device=%s\n",g_settings.ai_log_manual?1:0,
+                g_settings.ai_log_file,g_settings.preferred_card,g_settings.ai_nvme_device);
+        int ok=ferror(f)==0 && fflush(f)==0 && fsync(fd)==0;
+        if(fclose(f)!=0) ok=0;
+        if(ok) ok=rename(tmp,file)==0;
+        if(!ok) unlink(tmp);
+        _exit(ok?0:2);
+    }
+    int status=0;
+    return waitpid(pid,&status,0)==pid && WIFEXITED(status) && WEXITSTATUS(status)==0;
+}
+
+/* Reusable CURL handle to avoid init/cleanup overhead on every poll */
+static CURL *g_curl = NULL;
+
+static CURL *get_curl_handle(void) {
+    if (!g_curl) {
+        g_curl = curl_easy_init();
+    }
+    return g_curl;
+}
+
+static void cleanup_curl_handle(void) {
+    if (g_curl) {
+        curl_easy_cleanup(g_curl);
+        g_curl = NULL;
+    }
+}
+
+/* The shared CURL handle must never retain a header-list pointer between calls.
+ * Treat a truncated response as a failure rather than parsing half a JSON value. */
+static int http_get_auth(const char *url, char *out, size_t cap, int timeout_ms, const char *bearer_token) {
+    if (!url || !out || cap < 2) return -1;
+    out[0] = '\0';
+    CURL *curl = get_curl_handle();
     if (!curl) return -1;
-    struct http_buf buf = { .data = malloc(1024), .size = 0 };
-    if (!buf.data) { curl_easy_cleanup(curl); return -1; }
+    struct http_buf buf = { .data = malloc(1024), .size = 0,
+                            .capacity = 1024, .limit = http_response_limit(cap) };
+    if (!buf.data) return -1;
+    struct curl_slist *headers = NULL;
+    if (bearer_token && bearer_token[0]) {
+        char auth_header[512];
+        int n = snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", bearer_token);
+        if (n < 0 || (size_t)n >= sizeof(auth_header) ||
+            !(headers = curl_slist_append(NULL, auth_header))) { free(buf.data); return -1; }
+    }
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, timeout_ms);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_NOPROXY, "*"); /* loopback APIs, never proxy */
     CURLcode rc = curl_easy_perform(curl);
     long http_code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-    curl_easy_cleanup(curl);
-    int ok = (rc == CURLE_OK && http_code == 200);
-    if (ok && buf.size > 0) {
-        size_t copy_len = buf.size < cap - 1 ? buf.size : cap - 1;
-        memcpy(out, buf.data, copy_len);
-        out[copy_len] = 0;
-    }
+    int ok = rc == CURLE_OK && http_code == 200 && buf.size > 0 && buf.size < cap;
+    if (ok) memcpy(out, buf.data, buf.size + 1);
+    /* Clear dangling pointers before freeing the per-request header list. */
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, NULL);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, NULL);
+    curl_slist_free_all(headers);
     free(buf.data);
     return ok ? 0 : -1;
+}
+
+static int http_get(const char *url, char *out, size_t cap, int timeout_ms) {
+    return http_get_auth(url, out, cap, timeout_ms, NULL);
 }
 
 /* Check if a TCP port is listening */
@@ -654,21 +984,139 @@ static int check_port(int port) {
     return rc == 0;
 }
 
+/* Discover llama-server once per 15 seconds from the kernel process table.
+ * This replaces four fork/ps/grep/awk subprocesses per second in AI mode.
+ * argv is NUL-delimited, so filenames with whitespace remain intact.
+ * Never log argv: it can contain an API key or private model pathname. */
+typedef struct {
+    bool found;
+    int port;
+    int context_size;
+    char api_key[256];
+    char model_name[128];
+    char cache_k[16];
+    char cache_v[16];
+    bool flash_attn;
+    bool mtp;
+} LlamaProcessInfo;
+
+static LlamaProcessInfo g_llama_process;
+static time_t g_llama_last_scan = 0;
+
+static bool llama_server_executable(const char *argv0) {
+    const char *name = strrchr(argv0, '/');
+    name = name ? name + 1 : argv0;
+    return strstr(name, "llama-server") != NULL || strstr(name, "llama_server") != NULL;
+}
+
+/* Testable, bounded parser for a single /proc/PID/cmdline buffer. */
+static bool llama_parse_cmdline(const char *argv, size_t used, LlamaProcessInfo *out) {
+    if (!argv || !used || !out) return false;
+    size_t exe_len = strnlen(argv, used);
+    if (exe_len == used || !llama_server_executable(argv)) return false;
+    LlamaProcessInfo info = { .found = true, .port = 8080 };
+    for (size_t pos = exe_len + 1; pos < used;) {
+        const char *arg = argv + pos;
+        size_t len = strnlen(arg, used - pos);
+        if (len == used - pos) break;
+        pos += len + 1;
+        if (!len) continue;
+        const char *value = NULL;
+        char option[64];
+        const char *eq = strchr(arg, '=');
+        if (eq && (size_t)(eq - arg) < sizeof(option)) {
+            size_t n = (size_t)(eq - arg);
+            memcpy(option, arg, n);
+            option[n] = '\0';
+            value = eq + 1;
+        } else {
+            if (len >= sizeof(option)) continue;
+            memcpy(option, arg, len + 1);
+            if (pos < used) {
+                size_t next_len = strnlen(argv + pos, used - pos);
+                if (next_len < used - pos && next_len && argv[pos] != '-') {
+                    value = argv + pos;
+                    pos += next_len + 1;
+                }
+            }
+        }
+        if (!value) continue;
+        if (!strcmp(option, "--port")) {
+            int port;
+            if (settings_int_in_range(value, 1, 65535, &port)) info.port = port;
+        } else if (!strcmp(option, "--api-key")) {
+            if (strlen(value) < sizeof(info.api_key)) text_copy(info.api_key, sizeof(info.api_key), value);
+        } else if (!strcmp(option, "--model") || !strcmp(option, "-m")) {
+            const char *base = strrchr(value, '/');
+            text_copy(info.model_name, sizeof(info.model_name), base ? base+1 : value);
+        } else if (!strcmp(option, "--ctx-size") || !strcmp(option, "-c")) {
+            int ctx;
+            if (settings_int_in_range(value, 1, INT_MAX, &ctx)) info.context_size = ctx;
+        } else if (!strcmp(option, "--cache-type-k")) {
+            text_copy(info.cache_k, sizeof(info.cache_k), value);
+        } else if (!strcmp(option, "--cache-type-v")) {
+            text_copy(info.cache_v, sizeof(info.cache_v), value);
+        } else if (!strcmp(option, "--flash-attn")) {
+            info.flash_attn = !strcmp(value, "on") || !strcmp(value, "1");
+        } else if (!strcmp(option, "--spec-type")) {
+            info.mtp = strstr(value, "mtp") != NULL;
+        }
+    }
+    *out = info;
+    return true;
+}
+
+static void refresh_llama_process(void) {
+    time_t now = time(NULL);
+    if (g_llama_last_scan && now >= g_llama_last_scan && now - g_llama_last_scan < 15) return;
+    g_llama_last_scan = now;
+    memset(&g_llama_process, 0, sizeof(g_llama_process));
+    DIR *dir = opendir("/proc");
+    if (!dir) return;
+    struct dirent *entry;
+    while ((entry = readdir(dir))) {
+        if (!isdigit((unsigned char)entry->d_name[0])) continue;
+        char path[96];
+        int n = snprintf(path, sizeof(path), "/proc/%s/cmdline", entry->d_name);
+        if (n < 0 || (size_t)n >= sizeof(path)) continue;
+        FILE *f = fopen(path, "rb");
+        if (!f) continue;
+        char args[8192];
+        size_t used = fread(args, 1, sizeof(args) - 1, f);
+        fclose(f);
+        args[used] = '\0';
+        if (llama_parse_cmdline(args, used, &g_llama_process)) break;
+    }
+    closedir(dir);
+}
+
+static int find_llama_port(void) {
+    refresh_llama_process();
+    return g_llama_process.found ? g_llama_process.port : 8080;
+}
+
+static void find_llama_api_key(char *out, size_t cap) {
+    refresh_llama_process();
+    text_copy(out, cap, g_llama_process.api_key);
+}
+
 /* Detect available AI servers */
 static void detect_ai_servers(SystemTelemetry *sys) {
-    sys->llama_available = check_port(8080);
+    sys->llama_available = check_port(find_llama_port());
     sys->ollama_available = check_port(11434);
     sys->vllm_available = check_port(8000);
+    /* Check for LM Studio/Bionic via lms CLI or HTTP */
+    sys->lmstudio_available = check_port(1234);
 }
 
 /* Heuristic token rate estimation from GPU power */
 static void estimate_tokens_heuristic(SystemTelemetry *sys, double gpu_power_w) {
     TokenRate *t = &sys->tokens;
-    
+
     /* Store power in history */
     t->power_history[t->power_history_idx] = gpu_power_w;
     t->power_history_idx = (t->power_history_idx + 1) % 100;
-    
+
     /* Calculate recent peak (last 2 seconds = 20 samples at 10Hz) */
     double peak = 0;
     for (int i = 0; i < 20; i++) {
@@ -676,7 +1124,7 @@ static void estimate_tokens_heuristic(SystemTelemetry *sys, double gpu_power_w) 
         if (t->power_history[idx] > peak) peak = t->power_history[idx];
     }
     t->recent_peak_w = peak;
-    
+
     /* Detect decode phase: power is 40-80% of recent peak and steady */
     double ratio = (peak > 0) ? gpu_power_w / peak : 0;
     if (ratio >= 0.4 && ratio <= 0.8 && peak > 50) {
@@ -685,7 +1133,7 @@ static void estimate_tokens_heuristic(SystemTelemetry *sys, double gpu_power_w) 
     } else if (ratio > 0.85) {
         t->in_decode_phase = false;
     }
-    
+
     if (t->in_decode_phase) {
         /* Estimate tokens/sec based on power
          * Typical decode: ~30-50W per token/sec for modern GPUs
@@ -706,32 +1154,109 @@ static void estimate_tokens_heuristic(SystemTelemetry *sys, double gpu_power_w) 
 /* Poll llama.cpp API for token stats */
 static void poll_llama_tokens(SystemTelemetry *sys) {
     TokenRate *t = &sys->tokens;
+    int port = find_llama_port();
+    char api_key[256];
+    find_llama_api_key(api_key, sizeof(api_key));
+    char url[128];
+    snprintf(url, sizeof(url), "http://127.0.0.1:%d/slots", port);
     char resp[4096];
-    if (http_get("http://127.0.0.1:8080/slots", resp, sizeof(resp), 500) != 0) {
+    if (http_get_auth(url, resp, sizeof(resp), 500, api_key) != 0) {
         t->has_data = false;
+        t->is_processing = false;
+        t->tokens_per_sec = 0;
+        t->prev_decoded = 0;
+        t->last_api_poll = (struct timespec){0};
+        text_copy(sys->ai_model_activity, sizeof(sys->ai_model_activity), "API unavailable");
         return;
     }
-    /* Parse JSON - look for "tokens_per_second" */
-    char *p = strstr(resp, "\"tokens_per_second\"");
+    /* Parse JSON - look for n_decoded in next_token */
+    /* Response format: [{"id":0,...,"is_processing":true/false,...,"next_token":[{"n_decoded":N,...}]}] */
+    char *p = strstr(resp, "\"n_decoded\"");
+    int64_t n_decoded = 0;
     if (p) {
         p = strchr(p, ':');
         if (p) {
             p++;
             while (*p == ' ' || *p == '\t') p++;
-            t->tokens_per_sec = strtod(p, NULL);
+            n_decoded = strtoll(p, NULL, 10);
+        }
+    }
+    if (!p || !strstr(resp, "\"n_decoded\"")) {
+        t->has_data = false;
+        t->is_processing = false;
+        t->tokens_per_sec = 0;
+        return;
+    }
+    /* Parse is_processing */
+    p = strstr(resp, "\"is_processing\"");
+    if (p) {
+        p = strchr(p, ':');
+        if (p) {
+            p++;
+            while (*p == ' ' || *p == '\t') p++;
+            t->is_processing = (*p == 't');
+        }
+    }
+
+    /* Parse n_prompt_tokens */
+    p = strstr(resp, "\"n_prompt_tokens\"");
+    if (p) {
+        p = strchr(p, ':');
+        if (p) {
+            p++;
+            while (*p == ' ' || *p == '\t') p++;
+            t->n_prompt_tokens = strtoll(p, NULL, 10);
+        }
+    }
+
+    /* Parse n_prompt_tokens_processed */
+    p = strstr(resp, "\"n_prompt_tokens_processed\"");
+    if (p) {
+        p = strchr(p, ':');
+        if (p) {
+            p++;
+            while (*p == ' ' || *p == '\t') p++;
+            t->n_prompt_tokens_processed = strtoll(p, NULL, 10);
+        }
+    }
+
+    /* Parse n_prompt_tokens_cache */
+    p = strstr(resp, "\"n_prompt_tokens_cache\"");
+    if (p) {
+        p = strchr(p, ':');
+        if (p) {
+            p++;
+            while (*p == ' ' || *p == '\t') p++;
+            t->n_prompt_tokens_cache = strtoll(p, NULL, 10);
+        }
+    }
+
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (t->last_api_poll.tv_sec > 0 || t->last_api_poll.tv_nsec > 0) {
+        double dt = (double)(now.tv_sec - t->last_api_poll.tv_sec) + (double)(now.tv_nsec - t->last_api_poll.tv_nsec) / 1e9;
+        double delta = (double)(n_decoded - t->prev_decoded);
+        if (dt > 0.0) {
+            t->tokens_per_sec = delta / dt;
+            if (t->tokens_per_sec < 0) t->tokens_per_sec = 0;
             t->has_data = true;
         }
     }
-    /* Also try prompt_tokens_per_second */
-    p = strstr(resp, "\"prompt_tokens_per_second\"");
-    if (p) {
-        p = strchr(p, ':');
-        if (p) {
-            p++;
-            while (*p == ' ' || *p == '\t') p++;
-            t->prompt_tokens_per_sec = strtod(p, NULL);
-        }
+
+    /* Determine activity state from /slots data */
+    if (!t->is_processing) {
+        snprintf(sys->ai_model_activity, sizeof(sys->ai_model_activity), "Idle");
+    } else if (t->n_prompt_tokens_processed < t->n_prompt_tokens) {
+        snprintf(sys->ai_model_activity, sizeof(sys->ai_model_activity), "Reading");
+    } else if (n_decoded != t->prev_decoded) {
+        snprintf(sys->ai_model_activity, sizeof(sys->ai_model_activity), "Outputting");
+    } else {
+        snprintf(sys->ai_model_activity, sizeof(sys->ai_model_activity), "Thinking");
     }
+
+    t->prev_decoded = n_decoded;
+    t->last_api_poll = now;
+    t->total_tokens = n_decoded;
 }
 
 /* Poll Ollama API for token stats */
@@ -740,6 +1265,7 @@ static void poll_ollama_tokens(SystemTelemetry *sys) {
     char resp[4096];
     if (http_get("http://127.0.0.1:11434/api/ps", resp, sizeof(resp), 500) != 0) {
         t->has_data = false;
+        t->tokens_per_sec = 0;
         return;
     }
     /* Ollama /api/ps returns loaded models but not token rates
@@ -754,6 +1280,7 @@ static void poll_vllm_tokens(SystemTelemetry *sys) {
     char resp[8192];
     if (http_get("http://127.0.0.1:8000/metrics", resp, sizeof(resp), 500) != 0) {
         t->has_data = false;
+        t->tokens_per_sec = 0;
         return;
     }
     /* Parse Prometheus metrics for vllm:generate_tokens_total or similar */
@@ -765,15 +1292,72 @@ static void poll_vllm_tokens(SystemTelemetry *sys) {
     }
     if (p) {
         /* Found some vLLM metrics - estimate from request count */
-        t->has_data = true;
-        t->tokens_per_sec = 0; /* Would need more parsing */
+        t->has_data = false;
+        t->tokens_per_sec = 0; /* Request metrics alone cannot establish token rate. */
     } else {
         t->has_data = false;
     }
 }
 
+/* Poll LM Studio/Bionic for token stats using lms CLI or HTTP API */
+static void poll_lmstudio_tokens(SystemTelemetry *sys) {
+    TokenRate *t = &sys->tokens;
+
+    /* Throttle lms CLI polling to every 2 seconds to avoid fork/exec overhead */
+    static time_t last_lms_poll = 0;
+    time_t now = time(NULL);
+    if (now - last_lms_poll < 2) {
+        /* Return cached state */
+        return;
+    }
+    last_lms_poll = now;
+
+    /* Try lms CLI first (Bionic) */
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "lms ps --json 2>/dev/null | head -c 2048");
+    FILE *f = popen(cmd, "r");
+    if (f) {
+        char buf[4096];
+        size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+        buf[n] = 0;
+        pclose(f);
+        if (strstr(buf, "model") || strstr(buf, "models")) {
+            t->has_data = false;
+            t->tokens_per_sec = 0; /* No real-time token rate in process listing. */
+            return;
+        }
+    }
+
+    /* Fall back to HTTP API (classic LM Studio) */
+    char resp[4096];
+    if (http_get("http://127.0.0.1:1234/api/v0/models", resp, sizeof(resp), 500) != 0) {
+        t->has_data = false;
+        t->tokens_per_sec = 0;
+        return;
+    }
+    if (strstr(resp, "[")) {
+        t->has_data = false; /* Model availability is not token throughput. */
+        t->tokens_per_sec = 0;
+    } else {
+        t->has_data = false;
+    }
+}
+
+/* Backend counters and cached rates have no meaning after a source change.
+ * This includes a previous /slots decode counter and heuristic power history. */
+static void token_rate_prepare_source(SystemTelemetry *sys) {
+    TokenRate *t = &sys->tokens;
+    if (!t->source_initialized || t->source_in_use != sys->token_source) {
+        memset(t, 0, sizeof(*t));
+        t->source_initialized = true;
+        t->source_in_use = sys->token_source;
+        sys->ai_model_activity[0] = '\0';
+    }
+}
+
 /* Main token rate sampling function */
 static void sample_tokens(SystemTelemetry *sys, double gpu_power_w) {
+    token_rate_prepare_source(sys);
     switch (sys->token_source) {
         case TOKEN_SOURCE_HEURISTIC:
             estimate_tokens_heuristic(sys, gpu_power_w);
@@ -791,6 +1375,588 @@ static void sample_tokens(SystemTelemetry *sys, double gpu_power_w) {
             poll_vllm_tokens(sys);
             snprintf(sys->tokens.source_label, sizeof(sys->tokens.source_label), "vLLM");
             break;
+        case TOKEN_SOURCE_LMSTUDIO:
+            poll_lmstudio_tokens(sys);
+            snprintf(sys->tokens.source_label, sizeof(sys->tokens.source_label), "LM Studio");
+            break;
+        case TOKEN_SOURCE_MAYA:
+            sys->tokens.has_data=false;sys->tokens.is_processing=false;
+            snprintf(sys->tokens.source_label,sizeof(sys->tokens.source_label),"Project Maya log");
+            break;
+        default:
+            estimate_tokens_heuristic(sys, gpu_power_w);
+            break;
+    }
+}
+
+/* Read model metadata from the same cached /proc command line used for API
+ * discovery. Unknown information is left unavailable, never guessed. */
+static void detect_ai_model_info(SystemTelemetry *sys) {
+    refresh_llama_process();
+    sys->ai_model_info_valid = g_llama_process.found;
+    if (!g_llama_process.found) {
+        sys->ai_model_name[0] = '\0';
+        sys->ai_ctx_size = 0;
+        sys->ai_cache_type_k[0] = '\0';
+        sys->ai_cache_type_v[0] = '\0';
+        sys->ai_flash_attn = false;
+        sys->ai_mtp = false;
+        return;
+    }
+    text_copy(sys->ai_model_name, sizeof(sys->ai_model_name), g_llama_process.model_name);
+    if (strlen(sys->ai_model_name) > 45)
+        memcpy(sys->ai_model_name+42, "...", 4);
+    sys->ai_ctx_size = g_llama_process.context_size;
+    text_copy(sys->ai_cache_type_k, sizeof(sys->ai_cache_type_k), g_llama_process.cache_k);
+    text_copy(sys->ai_cache_type_v, sizeof(sys->ai_cache_type_v), g_llama_process.cache_v);
+    sys->ai_flash_attn = g_llama_process.flash_attn;
+    sys->ai_mtp = g_llama_process.mtp;
+}
+
+/* Select by modification time, not alphabetical filename, and ignore directories.
+ * Bionic uses nested month directories; the latest file can be in any month. */
+static void ai_log_consider(char *best, size_t cap, time_t *best_mtime, const char *path) {
+    struct stat st;
+    if (stat(path, &st) == 0 && S_ISREG(st.st_mode) &&
+        (!best[0] || st.st_mtime > *best_mtime ||
+         (st.st_mtime == *best_mtime && strcmp(path, best) > 0))) {
+        text_copy(best, cap, path);
+        *best_mtime = st.st_mtime;
+    }
+}
+
+/* NVMe namespaces only (nvme0n1 etc.); avoid partition counters and
+ * double-counting by never summing namespace and partition traffic. */
+static bool nvme_namespace_name(const char *name) {
+    if(strncmp(name,"nvme",4)) return false;
+    const char *p=name+4;
+    if(!isdigit((unsigned char)*p)) return false;
+    while(isdigit((unsigned char)*p)) ++p;
+    if(*p++!='n' || !isdigit((unsigned char)*p)) return false;
+    while(isdigit((unsigned char)*p)) ++p;
+    return !*p;
+}
+static bool nvme_parse_stat(const char *line, uint64_t *rd, uint64_t *wr, uint64_t *busy) {
+    unsigned long long a[11]={0};
+    if(sscanf(line,"%llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
+              &a[0],&a[1],&a[2],&a[3],&a[4],&a[5],&a[6],&a[7],&a[8],&a[9],&a[10])!=11) return false;
+    *rd=a[2]; *wr=a[6]; *busy=a[9];
+    return true;
+}
+static void nvme_discover(NvmeMonitor *nv) {
+    DIR *d=opendir("/sys/block");
+    if(!d) return;
+    nv->device_count=0;
+    struct dirent *e;
+    while((e=readdir(d)) && nv->device_count<(int)(sizeof(nv->devices)/sizeof(nv->devices[0]))) {
+        if(!nvme_namespace_name(e->d_name)) continue;
+        NvmeDevice *dev=&nv->devices[nv->device_count];
+        text_copy(dev->name,sizeof(dev->name),e->d_name);
+        char file[MAX_PATH_LEN];
+        snprintf(file,sizeof(file),"/sys/block/%s/device/model",e->d_name);
+        FILE *f=fopen(file,"r");
+        if(f){ if(!fgets(dev->model,sizeof(dev->model),f)) dev->model[0]=0; fclose(f); trim(dev->model); }
+        else text_copy(dev->model,sizeof(dev->model),"NVMe namespace");
+        nv->device_count++;
+    }
+    closedir(d);
+    /* If a selected device disappears, do not silently switch to a different
+       SSD and mislabel its activity. User must explicitly choose a new one. */
+    if(!nv->selected[0] && nv->device_count)
+        text_copy(nv->selected,sizeof(nv->selected),nv->devices[0].name);
+}
+static void nvme_select(NvmeMonitor *nv,const char *name) {
+    if(strcmp(nv->selected,name)) {
+        text_copy(nv->selected,sizeof(nv->selected),name);
+        nv->have_prev=false; nv->valid=false;
+        nv->read_mib_s=nv->write_mib_s=nv->busy_pct=0;
+        nv->peak_read_mib_s=nv->peak_write_mib_s=0;
+    }
+}
+static void nvme_sample(NvmeMonitor *nv) {
+    time_t now_wall=time(NULL);
+    if(!nv->last_discover || now_wall-nv->last_discover>=30) {
+        nvme_discover(nv); nv->last_discover=now_wall;
+    }
+    if(!nv->selected[0] || !nvme_namespace_name(nv->selected)) {nv->valid=false;nv->have_prev=false;return;}
+    char path[128];
+    snprintf(path,sizeof(path),"/sys/block/%s/stat",nv->selected);
+    char line[512];
+    FILE *f=fopen(path,"r");
+    if(!f) {nv->valid=false;nv->have_prev=false;return;}
+    bool ok=fgets(line,sizeof(line),f)!=NULL;
+    fclose(f);
+    uint64_t rd=0,wr=0,busy=0;
+    if(!ok || !nvme_parse_stat(line,&rd,&wr,&busy)) {nv->valid=false;nv->have_prev=false;return;}
+    struct timespec tm;
+    clock_gettime(CLOCK_MONOTONIC,&tm);
+    if(nv->have_prev) {
+        double dt=(tm.tv_sec-nv->prev_time.tv_sec)+(tm.tv_nsec-nv->prev_time.tv_nsec)/1e9;
+        if(dt>=0.5 && rd>=nv->prev_read_sectors && wr>=nv->prev_write_sectors && busy>=nv->prev_busy_ms) {
+            nv->read_mib_s=(rd-nv->prev_read_sectors)/2048.0/dt;
+            nv->write_mib_s=(wr-nv->prev_write_sectors)/2048.0/dt;
+            nv->busy_pct=fmin(100.0,(busy-nv->prev_busy_ms)/(dt*10.0));
+            nv->peak_read_mib_s=fmax(nv->peak_read_mib_s,nv->read_mib_s);
+            nv->peak_write_mib_s=fmax(nv->peak_write_mib_s,nv->write_mib_s);
+            nv->valid=true;
+        } else if(dt<0.5) return;
+        else {nv->valid=false;nv->peak_read_mib_s=nv->peak_write_mib_s=0;}
+    }
+    nv->prev_read_sectors=rd;nv->prev_write_sectors=wr;nv->prev_busy_ms=busy;
+    nv->prev_time=tm;nv->have_prev=true;
+}
+
+/* Dedicated Maya parser: no attempt to pass its records through the task/slot
+ * timing grammar used by llama.cpp. Each log scan is a bounded tail. */
+static void maya_parse_lines(const char *log, MayaLogMonitor *out) {
+    memset(out,0,sizeof(*out));
+    if(!log) return;
+    for(const char *p=log;*p;) {
+        const char *end=strchr(p,'\n');
+        size_t len=end?(size_t)(end-p):strlen(p);
+        if(len>0 && len<1024) {
+            char line[1024];memcpy(line,p,len);line[len]=0;
+            char *mark=NULL;
+            const char *prefixes[]={"glm prefill:","glm fast:","glm stat:","glm split", "glm spec:",
+                                    "ds4 prefill:","ds4 fast:","ds4 stat:","ds4 split"};
+            for(size_t i=0;i<sizeof(prefixes)/sizeof(prefixes[0]);++i) {
+                mark=strstr(line,prefixes[i]); if(mark) break;
+            }
+            if(mark) {
+                out->recognized++;
+                if(out->count<3) out->count++;
+                for(int j=out->count-1;j>0;--j) text_copy(out->recent[j],sizeof(out->recent[j]),out->recent[j-1]);
+                text_copy(out->recent[0],sizeof(out->recent[0]),mark);
+                if(strstr(mark,"glm stat:") || strstr(mark,"ds4 stat:")) {
+                    const char *dec=strstr(mark,"decode ");
+                    double mspt=0,tps=0;
+                    if(dec && sscanf(dec,"decode %lf ms/tok (%lf tok/s)",&mspt,&tps)==2 &&
+                       isfinite(mspt) && isfinite(tps) && mspt>0 && tps>0) {
+                        out->decode_valid=true;out->decode_ms_per_tok=mspt;out->decode_tps=tps;
+                    }
+                    const char *hit=strstr(mark,"vram hit ");
+                    if(hit && sscanf(hit,"vram hit %lf%%",&out->vram_hit_pct)==1 &&
+                       isfinite(out->vram_hit_pct) && out->vram_hit_pct>=0 && out->vram_hit_pct<=100)
+                        out->vram_hit_valid=true;
+                    const char *ram=strstr(mark,"ram fetches ");
+                    if(ram && sscanf(ram,"ram fetches %lf/tok",&out->ram_fetches_per_token)==1 &&
+                       isfinite(out->ram_fetches_per_token) && out->ram_fetches_per_token>=0)
+                        out->ram_fetch_valid=true;
+                    const char *disk=strstr(mark,"disk ");
+                    double reads=0,waits=0,ms=0;
+                    if(disk && sscanf(disk,"disk %lf reads/tok in %lf waits/tok, %lf ms/tok",
+                                     &reads,&waits,&ms)==3 &&
+                       isfinite(reads) && isfinite(ms) && reads>=0 && ms>=0) {
+                        out->disk_valid=true;out->disk_reads_per_token=reads;out->disk_wait_ms_per_token=ms;
+                    }
+                }
+                if(strstr(mark,"prefill:")) {
+                    long tokens=0;double ms=0;
+                    const char *v=strchr(mark,':');
+                    if(v && sscanf(v+1," %ld tokens in %lf ms",&tokens,&ms)==2 && tokens>0 && ms>0) {
+                        out->prefill_valid=true;out->prefill_tps=tokens*1000.0/ms;out->prompt_tokens=tokens;
+                    }
+                }
+                /* Decoder speed records are not guaranteed to share a format
+                 * across Maya models; display the original line unaltered. */
+            }
+        }
+        if(!end) break;
+        p=end+1;
+    }
+}
+
+static void detect_ai_log(SystemTelemetry *sys) {
+    if (g_settings.ai_log_manual) {
+        text_copy(sys->ai_log_path,sizeof(sys->ai_log_path),g_settings.ai_log_file);
+        text_copy(sys->ai_log_source,sizeof(sys->ai_log_source),"Manual");
+        return;
+    }
+    const char *home = getenv("HOME");
+    const char *sudo_user = getenv("SUDO_USER");
+    if (sudo_user) {
+        struct passwd *pw = getpwnam(sudo_user);
+        if (pw && pw->pw_dir) home = pw->pw_dir;
+    }
+    sys->ai_log_path[0] = '\0';
+    sys->ai_log_source[0] = '\0';
+    if (!home) return;
+    char root[MAX_PATH_LEN], month[MAX_PATH_LEN], candidate[MAX_PATH_LEN];
+    char best[MAX_PATH_LEN] = "";
+    time_t best_mtime = 0;
+    if (snprintf(root, sizeof(root), "%s/.lmstudio/apps/bionic/server-logs", home) < (int)sizeof(root)) {
+        DIR *months = opendir(root);
+        if (months) {
+            struct dirent *m;
+            while ((m = readdir(months))) {
+                if (m->d_name[0] == '.' || !path_join(month, sizeof(month), root, m->d_name)) continue;
+                DIR *logs = opendir(month);
+                if (!logs) continue;
+                struct dirent *f;
+                while ((f = readdir(logs))) {
+                    if (f->d_name[0] == '.' || !path_join(candidate, sizeof(candidate), month, f->d_name)) continue;
+                    ai_log_consider(best, sizeof(best), &best_mtime, candidate);
+                }
+                closedir(logs);
+            }
+            closedir(months);
+        }
+    }
+    if (g_settings.log_parser == LOG_MAYA || (g_settings.log_parser==LOG_AUTO && !best[0])) {
+        const char *roots[]={"src/project-maya","project-maya","Downloads/project-maya"};
+        char maya_best[MAX_PATH_LEN]=""; time_t maya_mtime=0;
+        for(size_t i=0;i<sizeof(roots)/sizeof(roots[0]);++i) {
+            if(snprintf(root,sizeof(root),"%s/%s",home,roots[i])>=(int)sizeof(root)) continue;
+            DIR *d=opendir(root);
+            if(!d) continue;
+            struct dirent *e;
+            while((e=readdir(d))) {
+                if(strncmp(e->d_name,"maya-",5)) continue;
+                size_t l=strlen(e->d_name);
+                if(l<9 || strcmp(e->d_name+l-4,".log")) continue;
+                if(path_join(candidate,sizeof(candidate),root,e->d_name))
+                    ai_log_consider(maya_best,sizeof(maya_best),&maya_mtime,candidate);
+            }
+            closedir(d);
+        }
+        if(maya_best[0]) {
+            text_copy(sys->ai_log_path,sizeof(sys->ai_log_path),maya_best);
+            text_copy(sys->ai_log_source,sizeof(sys->ai_log_source),"Project Maya");
+            return;
+        }
+        if(g_settings.log_parser==LOG_MAYA) return;
+    }
+    if (best[0]) {
+        text_copy(sys->ai_log_path, sizeof(sys->ai_log_path), best);
+        text_copy(sys->ai_log_source, sizeof(sys->ai_log_source), "Bionic");
+        return;
+    }
+    if (snprintf(candidate, sizeof(candidate), "%s/.ollama/logs/server.log", home) < (int)sizeof(candidate) &&
+        access(candidate, R_OK) == 0) {
+        text_copy(sys->ai_log_path, sizeof(sys->ai_log_path), candidate);
+        text_copy(sys->ai_log_source, sizeof(sys->ai_log_source), "Ollama");
+    } else if (snprintf(candidate, sizeof(candidate), "%s/.cache/vllm/log.txt", home) < (int)sizeof(candidate) &&
+               access(candidate, R_OK) == 0) {
+        text_copy(sys->ai_log_path, sizeof(sys->ai_log_path), candidate);
+        text_copy(sys->ai_log_source, sizeof(sys->ai_log_source), "vLLM");
+    }
+}
+
+static void ai_log_timing_values(const char *p, double *ms, double *tokens,
+                                 double *mspt, double *tps) {
+    *ms = *tokens = *mspt = *tps = 0.0;
+    const char *eq = strchr(p, '=');
+    if (!eq) return;
+    char *after;
+    *ms = strtod(eq + 1, &after);
+    const char *slash = strchr(after, '/');
+    if (slash) *tokens = strtod(slash + 1, &after);
+    const char *paren = strchr(after, '(');
+    if (paren) {
+        *mspt = strtod(paren + 1, &after);
+        const char *comma = strchr(after, ',');
+        if (comma) *tps = strtod(comma + 1, NULL);
+    }
+    if (*ms > 0 && *tokens > 0) {
+        if (*mspt <= 0) *mspt = *ms / *tokens;
+        if (*tps <= 0) *tps = 1000.0 * *tokens / *ms;
+    }
+}
+
+/* Parse ALL timings in a bounded tail and merge prompt/eval/total lines by
+ * (slot, task). Keep the most recently updated tasks, never the first N lines. */
+static int ai_log_parse_lines(char *buf, AiLogEvent *out, int max_events) {
+    int count = 0;
+    char *save = NULL;
+    for (char *line = strtok_r(buf, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        if (!strstr(line, "print_timing")) continue;
+        const char *tp = strstr(line, "task ");
+        const char *sp = strstr(line, "id ");
+        if (!tp || !sp) continue;
+        int task = atoi(tp + 5), slot = atoi(sp + 3);
+        if (task < 0 || slot < 0) continue;
+        const char *metric = NULL;
+        int kind = 0;
+        if ((metric = strstr(line, "prompt eval time"))) kind = 1;
+        else if ((metric = strstr(line, "eval time"))) kind = 2;
+        else if ((metric = strstr(line, "total time"))) kind = 3;
+        if (!kind) continue;
+        int idx = -1;
+        for (int i = 0; i < count; i++)
+            if (out[i].task_id == task && out[i].slot_id == slot) { idx = i; break; }
+        AiLogEvent ev = {0};
+        if (idx >= 0) {
+            ev = out[idx];
+            memmove(&out[idx], &out[idx+1], (size_t)(count - idx - 1) * sizeof(*out));
+            count--;
+        } else { ev.task_id = task; ev.slot_id = slot; }
+        int yy=0,mm=0,dd=0,hh=0,mi=0,ss=0;
+        if (sscanf(line, "[%d-%d-%d %d:%d:%d]", &yy, &mm, &dd, &hh, &mi, &ss) == 6)
+            snprintf(ev.time_str, sizeof(ev.time_str), "%02d:%02d:%02d", hh, mi, ss);
+        else if (!ev.time_str[0]) text_copy(ev.time_str, sizeof(ev.time_str), "--:--:--");
+        double ms=0, tok=0, mspt=0, tps=0;
+        ai_log_timing_values(metric, &ms, &tok, &mspt, &tps);
+        if (kind == 1) {
+            ev.prompt_eval_ms = ms; ev.prompt_tokens = tok;
+            ev.prompt_ms_per_token = mspt; ev.prompt_tps = tps; ev.has_prompt = true;
+        } else if (kind == 2) {
+            ev.eval_ms = ms; ev.eval_tokens = tok;
+            ev.eval_ms_per_token = mspt; ev.eval_tps = tps; ev.has_eval = true;
+        } else {
+            ev.total_ms = ms; ev.total_tokens = tok; ev.has_total = true;
+        }
+        if (!ev.has_total) {
+            ev.total_ms = ev.prompt_eval_ms + ev.eval_ms;
+            ev.total_tokens = ev.prompt_tokens + ev.eval_tokens;
+        }
+        if (count == max_events) {
+            memmove(&out[0], &out[1], (size_t)(count - 1) * sizeof(*out));
+            count--;
+        }
+        out[count++] = ev;
+    }
+    return count;
+}
+
+/* Return only a setting that is an actual number (in MiB), not a guessed
+ * proportion of process RSS or GPU VRAM. -1 means unlimited, 0 disabled. */
+static bool ai_cache_parse_limit(const char *value, double *limit_mib) {
+    if (!value || !*value) return false;
+    errno = 0;
+    char *end = NULL;
+    long number = strtol(value, &end, 10);
+    if (errno || end == value || (number < -1) || number > 1048576L) return false;
+    if (*end && !isspace((unsigned char)*end)) return false;
+    *limit_mib = (double)number;
+    return true;
+}
+
+/* Read a running llama-server's configured --cache-ram/LLAMA_ARG_CACHE_RAM.
+ * Bionic launches llama-server separately, so inspecting our own environment
+ * would normally be wrong. Sample infrequently (30 s); never modify /proc. */
+static bool ai_cache_process_limit(double *limit_mib) {
+    DIR *dir = opendir("/proc");
+    if (!dir) return false;
+    struct dirent *entry;
+    bool found = false;
+    while ((entry = readdir(dir)) != NULL && !found) {
+        if (!isdigit((unsigned char)entry->d_name[0])) continue;
+        char path[96], argv[8192];
+        int n = snprintf(path, sizeof(path), "/proc/%s/cmdline", entry->d_name);
+        if (n < 0 || (size_t)n >= sizeof(path)) continue;
+        FILE *f = fopen(path, "rb");
+        if (!f) continue;
+        size_t used = fread(argv, 1, sizeof(argv)-1, f);
+        fclose(f);
+        if (!used) continue;
+        argv[used] = '\0';
+        const char *exe = strrchr(argv, '/');
+        exe = exe ? exe+1 : argv;
+        if (!strstr(exe, "llama-server") && !strstr(exe, "llama_server")) continue;
+        /* Command-line arguments are NUL-delimited. Check both syntaxes. */
+        for (size_t i = strlen(argv)+1; i < used && !found;) {
+            const char *a = argv+i;
+            size_t remain = used-i;
+            size_t len = strnlen(a, remain);
+            if (len == remain) break;
+            if (!strcmp(a, "--cache-ram") || !strcmp(a, "-cram")) {
+                size_t j = i+len+1;
+                if (j < used) found = ai_cache_parse_limit(argv+j, limit_mib);
+            } else if (!strncmp(a, "--cache-ram=", 12)) {
+                found = ai_cache_parse_limit(a+12, limit_mib);
+            }
+            i += len+1;
+        }
+        if (found) break;
+        n = snprintf(path, sizeof(path), "/proc/%s/environ", entry->d_name);
+        if (n < 0 || (size_t)n >= sizeof(path)) continue;
+        f = fopen(path, "rb");
+        if (!f) continue;
+        char env[65536];
+        used = fread(env, 1, sizeof(env)-1, f);
+        fclose(f);
+        env[used] = '\0';
+        for (size_t i=0; i < used && !found;) {
+            const char *a = env+i;
+            size_t len = strnlen(a, used-i);
+            if (len == used-i) break;
+            if (!strncmp(a, "LLAMA_ARG_CACHE_RAM=", 20))
+                found = ai_cache_parse_limit(a+20, limit_mib);
+            i += len+1;
+        }
+    }
+    closedir(dir);
+    return found;
+}
+
+/* Scan the same bounded log tail as the timing parser. Unlike estimated RAM
+ * figures, 'cache state' reports real cache occupancy and number of entries.
+ * Counters reflect the *visible log tail*, not lifetime cumulative totals.
+ * Keep this parser non-destructive; the timing parser reuses the same buffer. */
+static void ai_cache_parse_lines(const char *buf, AiPromptCache *out) {
+    memset(out, 0, sizeof(*out));
+    if (!buf) return;
+    for (const char *p=buf; *p;) {
+        const char *end = strchr(p, '\n');
+        size_t len = end ? (size_t)(end-p) : strlen(p);
+        if (len < 1024) {
+            char line[1024];
+            memcpy(line, p, len);
+            line[len] = '\0';
+            const char *mark;
+            int entries;
+            double used, limit;
+            if ((mark = strstr(line, "cache state:")) &&
+                sscanf(mark, "cache state: %d prompts, %lf MiB (limits: %lf MiB", &entries, &used, &limit) == 3 &&
+                entries >= 0 && used >= 0 && limit >= -1) {
+                out->usage_valid = true;
+                out->limit_valid = true;
+                out->entries = entries;
+                out->used_mib = used;
+                out->limit_mib = limit;
+            } else if ((mark = strstr(line, "prompt cache is enabled, size limit:"))) {
+                mark += strlen("prompt cache is enabled, size limit:");
+                while (*mark == ' ') mark++;
+                if (strstr(mark, "no limit")) {
+                    out->limit_valid = true;
+                    out->limit_mib = -1;
+                } else if (sscanf(mark, "%lf MiB", &limit)==1 && limit >= 0) {
+                    out->limit_valid = true;
+                    out->limit_mib = limit;
+                }
+            } else if (strstr(line, "prompt cache is disabled")) {
+                out->limit_valid = true;
+                out->limit_mib = 0;
+            }
+            if (strstr(line, "saving prompt with length") && strstr(line, "total state size"))
+                out->save_attempts++;
+            if (strstr(line, "found better prompt with f_keep")) out->matches++;
+            if ((mark = strstr(line, "making room for prompt cache entry, removing oldest entry"))) {
+                out->evictions++;
+                if ((mark = strstr(mark, "size = ")) && sscanf(mark, "size = %lf MiB", &used)==1 && used>=0)
+                    out->evicted_mib += used;
+            }
+            if ((mark = strstr(line, "prompt state size")) && strstr(mark, "exceeds cache size limit")) {
+                out->rejected++;
+                if (sscanf(mark, "prompt state size %lf MiB exceeds cache size limit %lf MiB", &used, &limit)==2) {
+                    out->last_rejected_mib = used;
+                    if (limit>=0) { out->limit_valid = true; out->limit_mib = limit; }
+                }
+            }
+            if (strstr(line, "failed to load prompt from cache")) out->load_failures++;
+            if (strstr(line, "forcing full prompt re-processing due to lack of cache data"))
+                out->forced_reprocess++;
+        }
+        if (!end) break;
+        p=end+1;
+    }
+}
+
+/* Keep parser configuration coherent without waiting for the 30-second log
+ * discovery timer or leaving historical values visible when logging is off. */
+static void parse_ai_log(SystemTelemetry *sys) {
+    static LogParser last_parser = LOG_COUNT;
+    static bool last_manual = false;
+    static char last_filename[MAX_PATH_LEN] = "";
+    if (last_parser != g_settings.log_parser ||
+        last_manual != g_settings.ai_log_manual ||
+        strcmp(last_filename, g_settings.ai_log_file) != 0) {
+        last_parser = g_settings.log_parser;
+        last_manual = g_settings.ai_log_manual;
+        text_copy(last_filename, sizeof(last_filename), g_settings.ai_log_file);
+        sys->ai_log_last_detect = 0;
+        sys->ai_log_last_update = 0;
+        sys->ai_log_path[0] = '\0';
+        sys->ai_log_event_count = 0;
+        memset(&sys->ai_prompt_cache, 0, sizeof(sys->ai_prompt_cache));
+        memset(g_ai_log_events, 0, sizeof(g_ai_log_events));
+        memset(&g_maya,0,sizeof(g_maya));
+    }
+    if (g_settings.log_parser == LOG_OFF) {
+        sys->ai_log_event_count = 0;
+        sys->ai_log_path[0] = '\0';
+        g_ai_log_path[0] = '\0';
+        memset(&sys->ai_prompt_cache, 0, sizeof(sys->ai_prompt_cache));
+        memset(g_ai_log_events, 0, sizeof(g_ai_log_events));
+        memset(&g_maya,0,sizeof(g_maya));
+        return;
+    }
+    time_t now = time(NULL);
+    if (!sys->ai_log_path[0] || now - sys->ai_log_last_detect >= 30) {
+        detect_ai_log(sys);
+        sys->ai_log_last_detect = now;
+    }
+    text_copy(g_ai_log_path, sizeof(g_ai_log_path), sys->ai_log_path);
+    if (now - sys->ai_log_last_update < 2) return;
+    sys->ai_log_last_update = now;
+    sys->ai_log_event_count = 0;
+    memset(&sys->ai_prompt_cache, 0, sizeof(sys->ai_prompt_cache));
+    if (now - sys->ai_cache_process_last_check >= 30 || !sys->ai_cache_process_last_check) {
+        sys->ai_cache_process_limit_valid = ai_cache_process_limit(&sys->ai_cache_process_limit_mib);
+        sys->ai_cache_process_last_check = now;
+    }
+    if (sys->ai_cache_process_limit_valid) {
+        sys->ai_prompt_cache.limit_valid = true;
+        sys->ai_prompt_cache.limit_mib = sys->ai_cache_process_limit_mib;
+    }
+    if (!sys->ai_log_path[0]) {memset(&g_maya,0,sizeof(g_maya));return;}
+    FILE *f = fopen(sys->ai_log_path, "r");
+    if (!f) {memset(&g_maya,0,sizeof(g_maya));return;}
+    struct stat st;
+    if (fstat(fileno(f), &st) != 0 || st.st_size <= 0) { fclose(f);memset(&g_maya,0,sizeof(g_maya));return; }
+    enum { AI_TAIL_BYTES = 512 * 1024 };
+    long offset = st.st_size > AI_TAIL_BYTES ? (long)(st.st_size - AI_TAIL_BYTES) : 0;
+    if (fseek(f, offset, SEEK_SET) != 0) { fclose(f);memset(&g_maya,0,sizeof(g_maya));return; }
+    char *buffer = malloc(AI_TAIL_BYTES + 1);
+    if (!buffer) { fclose(f);memset(&g_maya,0,sizeof(g_maya));return; }
+    size_t len = fread(buffer, 1, AI_TAIL_BYTES, f);
+    fclose(f);
+    buffer[len] = 0;
+    char *start = buffer;
+    if (offset && (start = strchr(buffer, '\n')) != NULL) start++;
+    if (start) {
+        memset(&g_maya,0,sizeof(g_maya));
+        bool maya_mode = g_settings.log_parser==LOG_MAYA ||
+                         (g_settings.log_parser==LOG_AUTO && !strcmp(sys->ai_log_source,"Project Maya"));
+        if (maya_mode) {
+            maya_parse_lines(start,&g_maya);
+            if(g_settings.token_source==TOKEN_SOURCE_MAYA) {
+                sys->tokens.has_data=false;sys->tokens.is_processing=false;
+                sys->tokens.tokens_per_sec=0;
+                sys->tokens.prompt_tokens_per_sec=g_maya.prefill_valid?g_maya.prefill_tps:0;
+                if(now>=st.st_mtime && now-st.st_mtime<=8 && g_maya.count)
+                    text_copy(sys->ai_model_activity,sizeof(sys->ai_model_activity),"Recent Maya log");
+                else text_copy(sys->ai_model_activity,sizeof(sys->ai_model_activity),"Idle / no recent log");
+            }
+        }
+        bool compatible = g_settings.log_parser==LOG_AUTO || g_settings.log_parser==LOG_LLAMA ||
+                          g_settings.log_parser==LOG_BIONIC;
+        if (compatible) ai_cache_parse_lines(start, &sys->ai_prompt_cache);
+        AiLogEvent ordered[AI_LOG_MAX_EVENTS] = {{0}};
+        int count = compatible ? ai_log_parse_lines(start, ordered, AI_LOG_MAX_EVENTS) : 0;
+        sys->ai_log_event_count = count;
+        for (int i = 0; i < count; i++) g_ai_log_events[i] = ordered[count - 1 - i];
+        /* A finished timing line is history, not proof of a live inference.
+         * Prefer live /slots processing state; otherwise classify fresh logs as recent. */
+        if (!sys->tokens.is_processing) {
+            const char *activity = "Idle";
+            if (now >= st.st_mtime && now - st.st_mtime <= 8 && count > 0) {
+                activity = g_ai_log_events[0].has_eval ? "Recent decoding" :
+                           g_ai_log_events[0].has_prompt ? "Recent prompt" : "Recent task";
+            }
+            snprintf(sys->ai_model_activity, sizeof(sys->ai_model_activity), "%s", activity);
+        }
+    }
+    free(buffer);
+    if (sys->ai_cache_process_limit_valid) {
+        /* A different limit in the log suggests old startup records or a
+         * previous backend. Never combine those stale usages with the new
+         * server's current limit. */
+        if (sys->ai_prompt_cache.limit_valid &&
+            fabs(sys->ai_prompt_cache.limit_mib - sys->ai_cache_process_limit_mib) > 0.1)
+            memset(&sys->ai_prompt_cache, 0, sizeof(sys->ai_prompt_cache));
+        sys->ai_prompt_cache.limit_valid = true;
+        sys->ai_prompt_cache.limit_mib = sys->ai_cache_process_limit_mib;
     }
 }
 
@@ -875,7 +2041,7 @@ static bool lookup_pci_ids_name(unsigned device, char *out, size_t cap) {
         char name[400] = {0};
         if (sscanf(line + 1, "%4x %399[^\n]", &dev, name) == 2 && dev == device) {
             trim(name);
-            snprintf(out, cap, "AMD %s", name);
+            snprintf(out, cap, "AMD %.150s", name);
             found = true;
             break;
         }
@@ -1180,6 +2346,7 @@ static int sysfs_open(const Gpu *g, Sysfs *s) {
         s->temp_emergency_mc[i] = -1;
     }
 
+    text_copy(s->gpu_base, sizeof(s->gpu_base), g->base);
     if (!path_join(s->policy_path, sizeof(s->policy_path), g->base, "power_dpm_force_performance_level")) return -1;
     if (!path_join(s->sclk_path, sizeof(s->sclk_path), g->base, "pp_dpm_sclk")) return -1;
     if (!path_join(s->mclk_path, sizeof(s->mclk_path), g->base, "pp_dpm_mclk")) return -1;
@@ -1507,6 +2674,57 @@ static long parse_dpm_max_mhz(const char *path) {
     return max_mhz;
 }
 
+/* PCIe negotiated link, GPU BAR0 aperture, and BAR resize capability.
+ * resource0_resize advertises possible sizes, NOT the currently active BAR size.
+ * The active aperture comes only from the first line of PCI sysfs `resource`. */
+static void sample_pcie_link(const Sysfs *s, PowerTelemetry *p) {
+    char path[MAX_PATH_LEN], value[128];
+    p->pcie_link_valid = false;
+    p->pcie_current_width = p->pcie_max_width = -1;
+    p->pcie_current_speed[0] = p->pcie_max_speed[0] = 0;
+    if (path_join(path, sizeof(path), s->gpu_base, "current_link_speed") &&
+        read_path_text(path, value, sizeof(value)) >= 0)
+        text_copy(p->pcie_current_speed, sizeof(p->pcie_current_speed), value);
+    if (path_join(path, sizeof(path), s->gpu_base, "max_link_speed") &&
+        read_path_text(path, value, sizeof(value)) >= 0)
+        text_copy(p->pcie_max_speed, sizeof(p->pcie_max_speed), value);
+    if (path_join(path, sizeof(path), s->gpu_base, "current_link_width"))
+        p->pcie_current_width = (int)read_optional_long_path(path, -1);
+    if (path_join(path, sizeof(path), s->gpu_base, "max_link_width"))
+        p->pcie_max_width = (int)read_optional_long_path(path, -1);
+    p->pcie_link_valid = p->pcie_current_width > 0 && p->pcie_current_speed[0] != 0;
+    p->bar0_valid = false;
+    p->bar0_bytes = 0;
+    if (path_join(path, sizeof(path), s->gpu_base, "resource")) {
+        FILE *f = fopen(path, "r");
+        if (f) {
+            unsigned long long begin=0, end=0, flags=0;
+            if (fscanf(f, "%llx %llx %llx", &begin, &end, &flags) == 3 &&
+                end >= begin && begin != 0 && (flags & 0x200ULL)) {
+                p->bar0_bytes = end - begin + 1ULL;
+                p->bar0_valid = true;
+            }
+            fclose(f);
+        }
+    }
+    p->rebar_supported = path_join(path, sizeof(path), s->gpu_base, "resource0_resize") && path_exists(path);
+    /* -1 means kernel auto: never show that as positively enabled. */
+    long dpm=read_optional_long_path("/sys/module/amdgpu/parameters/dpm", -2);
+    p->amdgpu_dpm = dpm >= -1 && dpm <= 1 ? (int)dpm : -2;
+}
+
+/* The PCIe link can downshift when idle. Only flag it as a possible bottleneck
+ * if the GPU is actually under load, rather than treating power savings as bad. */
+static int pcie_downshift_under_load(const PowerTelemetry *p) {
+    if (!p->pcie_link_valid || !p->pcie_max_speed[0] || p->pcie_max_width <= 0 || p->gpu_busy < 0)
+        return -1;
+    if (p->gpu_busy < 40) return 0;
+    double cur = strtod(p->pcie_current_speed, NULL);
+    double max = strtod(p->pcie_max_speed, NULL);
+    if (cur <= 0.0 || max <= 0.0) return -1;
+    return (p->pcie_current_width < p->pcie_max_width || cur + 0.5 < max) ? 1 : 0;
+}
+
 static void sample_power(Sysfs *s, PowerTelemetry *p) {
     p->gpu_busy = (int)read_long_fd(s->fd_busy, -1);
     p->mem_busy = (int)read_long_fd(s->fd_mem_busy, -1);
@@ -1557,11 +2775,13 @@ static void sample_power(Sysfs *s, PowerTelemetry *p) {
     snprintf(p->freq1_label, sizeof(p->freq1_label), "%s", s->freq1_label[0] ? s->freq1_label : "freq1");
     snprintf(p->freq2_label, sizeof(p->freq2_label), "%s", s->freq2_label[0] ? s->freq2_label : "freq2");
     long vu = read_long_fd(s->fd_vram_used, -1);
+    p->vram_usage_valid = vu >= 0;
     if (vu >= 0) p->vram_used = (unsigned long long)vu;
     /* These are useful for diagnosis but may involve more driver/SMU work.
        Sample them at ~1 Hz instead of putting them on the 10 Hz fast telemetry path. */
     if ((p->slow_tick++ % 10U) == 0U || !p->power_profile[0]) {
         parse_active_power_profile(s->fd_power_profile, p->power_profile, sizeof(p->power_profile));
+        sample_pcie_link(s, p);
         if (s->fd_pcie_bw >= 0) {
             if (read_fd_text(s->fd_pcie_bw, p->pcie_bw, sizeof(p->pcie_bw)) < 0)
                 snprintf(p->pcie_bw, sizeof(p->pcie_bw), "unavailable");
@@ -1587,6 +2807,7 @@ static void sample_power(Sysfs *s, PowerTelemetry *p) {
         p->mem_hz_max = parse_dpm_max_mhz(s->mclk_path);
     }
 
+    p->pcie_link_loaded_low = pcie_downshift_under_load(p);
     uint32_t v;
     p->gfxoff_enabled = read_u32_binary_path(s->gfxoff_path, &v) == 0 ? (int)v : -1;
     if (read_u32_binary_path(s->gfxoff_status_path, &v) == 0) {
@@ -1602,6 +2823,7 @@ static void discover_cpu_temp(SystemTelemetry *s) {
     if (s->cpu_temp_discovered) return;
     s->cpu_temp_discovered = true;
     s->fd_cpu_temp = -1;
+    s->fd_cpu_tctl = -1;
     s->cpu_temp_crit_mc = -1;
 
     DIR *d = opendir("/sys/class/hwmon");
@@ -1609,6 +2831,9 @@ static void discover_cpu_temp(SystemTelemetry *s) {
     char best_path[MAX_PATH_LEN] = "";
     char best_label[32] = "";
     char best_crit[MAX_PATH_LEN] = "";
+    char tctl_path[MAX_PATH_LEN] = "";
+    char tctl_driver[32] = "";
+    int tctl_score = -1;
     int best_score = -1;
     struct dirent *de;
 
@@ -1629,6 +2854,11 @@ static void discover_cpu_temp(SystemTelemetry *s) {
             if (path_join(labp, sizeof(labp), base, leaf))
                 (void)read_path_text(labp, label, sizeof(label));
 
+            if (strcasestr(label, "tctl") && chip_score >= tctl_score) {
+                text_copy(tctl_path, sizeof(tctl_path), inp);
+                text_copy(tctl_driver, sizeof(tctl_driver), name);
+                tctl_score = chip_score;
+            }
             int score = chip_score;
             if (strcasestr(label, "tdie")) score += 40;
             else if (strcasestr(label, "tctl")) score += 30;
@@ -1649,6 +2879,12 @@ static void discover_cpu_temp(SystemTelemetry *s) {
     }
     closedir(d);
 
+    if (tctl_path[0]) {
+        text_copy(s->cpu_tctl_path, sizeof(s->cpu_tctl_path), tctl_path);
+        snprintf(s->cpu_tctl_label, sizeof(s->cpu_tctl_label), "CPU Tctl (%s)",
+                 tctl_driver[0] ? tctl_driver : "hwmon");
+        s->fd_cpu_tctl = open(tctl_path, O_RDONLY | O_CLOEXEC);
+    }
     if (best_path[0]) {
         text_copy(s->cpu_temp_path, sizeof(s->cpu_temp_path), best_path);
         text_copy(s->cpu_temp_label, sizeof(s->cpu_temp_label), best_label[0] ? best_label : "CPU");
@@ -1811,125 +3047,114 @@ static void discover_motherboard_temps(SystemTelemetry *s) {
             if (label[0])
                 text_copy(s->mb_temp_labels[idx], sizeof(s->mb_temp_labels[idx]), label);
             else
-                snprintf(s->mb_temp_labels[idx], sizeof(s->mb_temp_labels[idx]), "%s T%d", name, ti);
+                snprintf(s->mb_temp_labels[idx], sizeof(s->mb_temp_labels[idx]), "%.18s T%u", name, (unsigned)ti);
             s->mb_temp_count++;
         }
     }
     closedir(d);
 }
 
+/* /proc/PID/stat contains '(comm)' which can include spaces and brackets.
+ * Work from the LAST ')' and count Linux fields 14/15 and 22 exactly. */
+static bool parse_proc_cpu_stat(const char *line, uint64_t *ticks, uint64_t *start_ticks) {
+    if (!line || !ticks || !start_ticks) return false;
+    const char *pos = strrchr(line, ')');
+    if (!pos) return false;
+    pos++;
+    uint64_t user = 0, kernel = 0, started = 0;
+    bool got_user = false, got_kernel = false, got_start = false;
+    for (int field = 3; field <= 22; ++field) {
+        while (*pos == ' ' || *pos == '\t') pos++;
+        if (!*pos) return false;
+        const char *end = pos;
+        while (*end && *end != ' ' && *end != '\t' && *end != '\n') end++;
+        if (field == 14 || field == 15 || field == 22) {
+            errno = 0;
+            char *number_end = NULL;
+            unsigned long long value = strtoull(pos, &number_end, 10);
+            if (errno || number_end != end) return false;
+            if (field == 14) {user = value; got_user = true;}
+            if (field == 15) {kernel = value; got_kernel = true;}
+            if (field == 22) {started = value; got_start = true;}
+        }
+        pos = end;
+    }
+    if (!got_user || !got_kernel || !got_start || UINT64_MAX - user < kernel) return false;
+    *ticks = user + kernel;
+    *start_ticks = started;
+    return true;
+}
+
+/* This is a real interval-based CPU ranking, rather than the previous lifetime
+ * CPU-time ranking. Percent is per logical CPU (a multithreaded process can
+ * exceed 100%). One /proc sweep every two seconds keeps the GUI lightweight. */
+#define TOP_PROC_HISTORY_CAP 512
+typedef struct {
+    pid_t pid;
+    uint64_t start_ticks;
+    uint64_t cpu_ticks;
+} TopProcSample;
 static void sample_top_processes(SystemTelemetry *s) {
-    s->top_proc_count = 0;
+    static TopProcSample previous[TOP_PROC_HISTORY_CAP];
+    static int previous_count = 0;
+    static struct timespec last = {0};
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long long elapsed_ns = diff_ns(now, last);
+    if (last.tv_sec && elapsed_ns < 2000000000LL) return;
 
-    /* Read /proc/[pid]/stat for CPU times and /proc/[pid]/comm for names */
-    DIR *d = opendir("/proc");
-    if (!d) return;
-
-    /* Simple approach: read /proc/[pid]/stat, compute CPU usage */
-    struct { pid_t pid; char name[16]; unsigned long long utime, stime; } procs[256];
-    int proc_count = 0;
-
-    struct dirent *de;
-    while ((de = readdir(d)) && proc_count < 256) {
-        if (!isdigit(de->d_name[0])) continue;
-        pid_t pid = atoi(de->d_name);
-
-        char statp[MAX_PATH_LEN], commp[MAX_PATH_LEN];
-        snprintf(statp, sizeof(statp), "/proc/%d/stat", pid);
-        snprintf(commp, sizeof(commp), "/proc/%d/comm", pid);
-
-        char statbuf[512];
-        if (read_path_text(statp, statbuf, sizeof(statbuf)) < 0) continue;
-
-        /* Parse utime and stime (fields 14 and 15) */
-        char *p = strchr(statbuf, ')');
-        if (!p) continue;
-        p++;
-        unsigned long long utime = 0, stime = 0;
-        int field = 0;
-        char *tok = p;
-        while (*tok && field < 14) {
-            tok = strchr(tok, ' ');
-            if (!tok) break;
-            tok++;
-            field++;
-        }
-        if (*tok) {
-            utime = strtoull(tok, &tok, 10);
-            if (*tok == ' ') {
-                tok++;
-                stime = strtoull(tok, NULL, 10);
+    DIR *dir = opendir("/proc");
+    if (!dir) return;
+    long hz = sysconf(_SC_CLK_TCK);
+    if (hz <= 0) { closedir(dir); return; }
+    double elapsed = last.tv_sec ? elapsed_ns / 1e9 : 0;
+    TopProcSample current[TOP_PROC_HISTORY_CAP];
+    int count = 0;
+    TopProcess top[3] = {{0}};
+    int top_count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) && count < TOP_PROC_HISTORY_CAP) {
+        if (!isdigit((unsigned char)entry->d_name[0])) continue;
+        char *pid_end = NULL;
+        long raw_pid = strtol(entry->d_name, &pid_end, 10);
+        if (!pid_end || *pid_end || raw_pid <= 0 || raw_pid > INT_MAX) continue;
+        pid_t pid = (pid_t)raw_pid;
+        char path[96], line[1024];
+        int n = snprintf(path, sizeof(path), "/proc/%ld/stat", raw_pid);
+        if (n <= 0 || (size_t)n >= sizeof(path) ||
+            read_path_text(path, line, sizeof(line)) < 0) continue;
+        uint64_t ticks, started;
+        if (!parse_proc_cpu_stat(line, &ticks, &started)) continue;
+        current[count++] = (TopProcSample){pid, started, ticks};
+        if (elapsed <= 0) continue;
+        double pct = 0;
+        for (int i = 0; i < previous_count; ++i) {
+            if (previous[i].pid == pid && previous[i].start_ticks == started &&
+                ticks >= previous[i].cpu_ticks) {
+                pct = 100.0 * (double)(ticks - previous[i].cpu_ticks) / (hz * elapsed);
+                break;
             }
         }
-
-        char comm[16] = "";
-        read_path_text(commp, comm, sizeof(comm));
-        /* Strip newline */
-        comm[strcspn(comm, "\n")] = 0;
-
-        procs[proc_count].pid = pid;
-        text_copy(procs[proc_count].name, sizeof(procs[proc_count].name), comm);
-        procs[proc_count].utime = utime;
-        procs[proc_count].stime = stime;
-        proc_count++;
-    }
-    closedir(d);
-
-    /* Sort by total CPU time (descending) and take top 3 */
-    for (int i = 0; i < proc_count - 1; i++) {
-        for (int j = i + 1; j < proc_count; j++) {
-            if (procs[j].utime + procs[j].stime > procs[i].utime + procs[i].stime) {
-                struct { pid_t pid; char name[16]; unsigned long long utime, stime; } tmp;
-                tmp.pid = procs[i].pid;
-                text_copy(tmp.name, sizeof(tmp.name), procs[i].name);
-                tmp.utime = procs[i].utime;
-                tmp.stime = procs[i].stime;
-                procs[i].pid = procs[j].pid;
-                text_copy(procs[i].name, sizeof(procs[i].name), procs[j].name);
-                procs[i].utime = procs[j].utime;
-                procs[i].stime = procs[j].stime;
-                procs[j].pid = tmp.pid;
-                text_copy(procs[j].name, sizeof(procs[j].name), tmp.name);
-                procs[j].utime = tmp.utime;
-                procs[j].stime = tmp.stime;
-            }
+        if (pct <= 0 || (top_count == 3 && pct <= top[2].cpu_pct)) continue;
+        char comm[32] = "";
+        n = snprintf(path, sizeof(path), "/proc/%ld/comm", raw_pid);
+        if (n > 0 && (size_t)n < sizeof(path))
+            (void)read_path_text(path, comm, sizeof(comm));
+        TopProcess item = {.pid = pid, .cpu_pct = pct};
+        text_copy(item.name, sizeof(item.name), comm);
+        int at = top_count < 3 ? top_count++ : 2;
+        while (at > 0 && pct > top[at-1].cpu_pct) {
+            top[at] = top[at-1];
+            at--;
         }
+        top[at] = item;
     }
-
-    int take = proc_count < 3 ? proc_count : 3;
-    for (int i = 0; i < take; i++) {
-        s->top_procs[i].pid = procs[i].pid;
-        text_copy(s->top_procs[i].name, sizeof(s->top_procs[i].name), procs[i].name);
-        s->top_procs[i].cpu_pct = 0.0; /* Simplified: just show the process */
-    }
-    s->top_proc_count = take;
-}
-
-/* Sort helper for percentile calculations */
-static void sort_doubles(double *arr, int n) {
-    for (int i = 0; i < n - 1; i++) {
-        for (int j = i + 1; j < n; j++) {
-            if (arr[j] < arr[i]) {
-                double tmp = arr[i];
-                arr[i] = arr[j];
-                arr[j] = tmp;
-            }
-        }
-    }
-}
-
-static double percentile(const double *arr, int n, double p) {
-    if (n <= 0) return 0.0;
-    if (n == 1) return arr[0];
-    double sorted[FRAMETIME_HISTORY_SIZE];
-    memcpy(sorted, arr, n * sizeof(double));
-    sort_doubles(sorted, n);
-    double rank = p / 100.0 * (n - 1);
-    int lower = (int)rank;
-    int upper = lower + 1;
-    double frac = rank - lower;
-    if (upper >= n) return sorted[n - 1];
-    return sorted[lower] + frac * (sorted[upper] - sorted[lower]);
+    closedir(dir);
+    memcpy(previous, current, (size_t)count * sizeof(*previous));
+    previous_count = count;
+    last = now;
+    s->top_proc_count = top_count;
+    memcpy(s->top_procs, top, (size_t)top_count * sizeof(top[0]));
 }
 
 /* Sample CPU per-core load from /proc/stat */
@@ -1941,30 +3166,30 @@ static void sample_cpu_cores(SystemTelemetry *s) {
     char line[256];
     while (fgets(line, sizeof(line), f)) {
         if (line[0] != 'c' || line[1] != 'p' || line[2] != 'u') break;
-        if (line[3] == ' ') break;  /* This is the aggregate 'cpu' line */
+        if (line[3] == ' ') continue;  /* Skip the aggregate 'cpu' line */
 
         unsigned long long user=0, nice=0, system=0, idle=0, iowait=0, irq=0, softirq=0, steal=0;
         int n = sscanf(line, "cpu%d %llu %llu %llu %llu %llu %llu %llu %llu",
                        &core, &user, &nice, &system, &idle, &iowait, &irq, &softirq, &steal);
         if (n < 4) break;
 
-        core--;  /* Convert to 0-indexed */
         if (core < 0 || core >= MAX_CPU_CORES) break;
+        int idx = core;  /* /proc/stat numbering starts at cpu0 */
 
         unsigned long long idle_all = idle + iowait;
         unsigned long long total = user + nice + system + idle_all + irq + softirq + steal;
 
-        if (s->cpu_cores.have_sample && total >= s->cpu_cores.prev_core_total[core] &&
-            idle_all >= s->cpu_cores.prev_core_idle[core]) {
-            unsigned long long dt = total - s->cpu_cores.prev_core_total[core];
-            unsigned long long di = idle_all - s->cpu_cores.prev_core_idle[core];
-            s->cpu_cores.load_pct[core] = (dt && di <= dt) ? (double)(dt - di) * 100.0 / (double)dt : 0.0;
+        if (s->cpu_cores.have_sample && total >= s->cpu_cores.prev_core_total[idx] &&
+            idle_all >= s->cpu_cores.prev_core_idle[idx]) {
+            unsigned long long dt = total - s->cpu_cores.prev_core_total[idx];
+            unsigned long long di = idle_all - s->cpu_cores.prev_core_idle[idx];
+            s->cpu_cores.load_pct[idx] = (dt && di <= dt) ? (double)(dt - di) * 100.0 / (double)dt : 0.0;
         }
 
-        s->cpu_cores.prev_core_total[core] = total;
-        s->cpu_cores.prev_core_idle[core] = idle_all;
-        if (core + 1 > s->cpu_cores.core_count) {
-            s->cpu_cores.core_count = core + 1;
+        s->cpu_cores.prev_core_total[idx] = total;
+        s->cpu_cores.prev_core_idle[idx] = idle_all;
+        if (idx + 1 > s->cpu_cores.core_count) {
+            s->cpu_cores.core_count = idx + 1;
         }
     }
     fclose(f);
@@ -1974,30 +3199,58 @@ static void sample_cpu_cores(SystemTelemetry *s) {
     }
 }
 
-/* Record a frametime sample and update statistics */
-static void record_frametime(FrametimeStats *ft, double ms) {
-    if (ms <= 0.0 || ms > 1000.0) return;  /* Sanity check */
-
-    ft->times_ms[ft->head] = ms;
-    ft->head = (ft->head + 1) % FRAMETIME_HISTORY_SIZE;
-    if (ft->count < FRAMETIME_HISTORY_SIZE) ft->count++;
-
-    /* Update running statistics */
-    if (ms > ft->max_ms) ft->max_ms = ms;
-    if (ft->min_ms <= 0.0 || ms < ft->min_ms) ft->min_ms = ms;
-
-    /* Recalculate percentiles from full history */
-    if (ft->count >= 10) {
-        ft->avg_ms = 0.0;
-        for (int i = 0; i < ft->count; i++) {
-            ft->avg_ms += ft->times_ms[i];
+static void sample_cpu_clocks(SystemTelemetry *s) {
+    double min_mhz=0.0, max_mhz=0.0, total_mhz=0.0, cap_mhz=0.0;
+    int count=0;
+    char path[MAX_PATH_LEN], base[128], label[64];
+    for (int core=0; core<MAX_CPU_CORES; core++) {
+        snprintf(base, sizeof(base), "/sys/devices/system/cpu/cpu%d/cpufreq", core);
+        if (!path_join(path, sizeof(path), base, "scaling_cur_freq")) continue;
+        long khz=read_optional_long_path(path, -1);
+        if (khz <= 0) {
+            if (!path_join(path, sizeof(path), base, "cpuinfo_cur_freq")) continue;
+            khz=read_optional_long_path(path, -1);
         }
-        ft->avg_ms /= ft->count;
-
-        ft->p1_ms = percentile(ft->times_ms, ft->count, 1.0);
-        ft->p01_ms = percentile(ft->times_ms, ft->count, 0.1);
-        ft->p001_ms = percentile(ft->times_ms, ft->count, 0.01);
+        if (khz <= 0) continue;
+        double mhz=khz / 1000.0;
+        if (!count || mhz < min_mhz) min_mhz=mhz;
+        if (mhz > max_mhz) max_mhz=mhz;
+        total_mhz+=mhz;
+        count++;
+        if (core == 0) {
+            if (path_join(path, sizeof(path), base, "scaling_governor") &&
+                read_path_text(path, label, sizeof(label)) >= 0)
+                text_copy(s->cpu_governor, sizeof(s->cpu_governor), label);
+        }
+        if (path_join(path, sizeof(path), base, "cpuinfo_max_freq")) {
+            long maxkhz=read_optional_long_path(path, -1);
+            if (maxkhz > 0 && maxkhz / 1000.0 > cap_mhz) cap_mhz=maxkhz / 1000.0;
+        }
     }
+    s->cpu_clock_count=count;
+    s->cpu_clock_min_mhz=count ? min_mhz : -1.0;
+    s->cpu_clock_avg_mhz=count ? total_mhz/count : -1.0;
+    s->cpu_clock_max_mhz=count ? max_mhz : -1.0;
+    s->cpu_clock_cap_mhz=cap_mhz;
+    /* cpufreq boost flag may be absent on modern amd-pstate systems. */
+    long boost=read_optional_long_path("/sys/devices/system/cpu/cpufreq/boost", -1);
+    s->cpu_boost=boost < 0 ? -1 : !!boost;
+    long smt=read_optional_long_path("/sys/devices/system/cpu/smt/active", -1);
+    s->cpu_smt=smt < 0 ? -1 : !!smt;
+}
+
+/* Resolve a sensor sibling without changing the saved pwm path.  Reading via
+ * read_optional_long_path closes its descriptor before returning. */
+static long read_cpu_fan_pwm_max(const char *pwm_path) {
+    if (!pwm_path || !*pwm_path) return 255;
+    char dir[MAX_PATH_LEN], path[MAX_PATH_LEN];
+    text_copy(dir, sizeof(dir), pwm_path);
+    char *slash = strrchr(dir, '/');
+    if (!slash) return 255;
+    slash[1] = '\0';
+    if (!path_join(path, sizeof(path), dir, "pwm1_max")) return 255;
+    long value = read_optional_long_path(path, 255);
+    return value > 0 ? value : 255;
 }
 
 static void sample_system(SystemTelemetry *s) {
@@ -2046,6 +3299,8 @@ static void sample_system(SystemTelemetry *s) {
     discover_cpu_temp(s);
     long cpu_mc = read_long_fd(s->fd_cpu_temp, -1);
     s->cpu_temp_c = cpu_mc >= 0 ? cpu_mc / 1000.0 : -1.0;
+    long tctl_mc = read_long_fd(s->fd_cpu_tctl, -1);
+    s->cpu_tctl_c = tctl_mc >= 0 ? tctl_mc / 1000.0 : -1.0;
 
     /* CPU CCX temps */
     discover_cpu_ccx_temps(s);
@@ -2062,17 +3317,12 @@ static void sample_system(SystemTelemetry *s) {
     }
     if (s->fd_cpu_fan_pct >= 0) {
         long pwm = read_long_fd(s->fd_cpu_fan_pct, -1);
-        long pwm_max = 255;
-        /* Try to read pwm1_max */
-        char maxp[MAX_PATH_LEN];
-        if (path_join(maxp, sizeof(maxp), dirname(s->cpu_fan_pct_path), "pwm1_max")) {
-            long m = read_long_fd(open(maxp, O_RDONLY | O_CLOEXEC), -1);
-            if (m > 0) pwm_max = m;
-        }
+        long pwm_max = read_cpu_fan_pwm_max(s->cpu_fan_pct_path);
         s->cpu_fan_pct = pwm >= 0 && pwm_max > 0 ? (double)pwm * 100.0 / (double)pwm_max : 0.0;
     }
 
-    /* CPU power */
+    /* CPU power: never show zero watts when the sensor does not exist. */
+    s->cpu_power_w=-1.0;
     discover_cpu_power(s);
     if (s->fd_cpu_power >= 0) {
         long uw = read_long_fd(s->fd_cpu_power, -1);
@@ -2089,8 +3339,16 @@ static void sample_system(SystemTelemetry *s) {
     /* Top processes */
     sample_top_processes(s);
 
-    /* CPU per-core load */
+    /* Per-core load is inexpensive and remains at 500 ms. CPU frequency
+     * collection probes many sysfs files; keep it to a 2-second cadence. */
     sample_cpu_cores(s);
+    struct timespec clock_now;
+    clock_gettime(CLOCK_MONOTONIC, &clock_now);
+    if ((!s->last_cpu_clock_scan.tv_sec && !s->last_cpu_clock_scan.tv_nsec) ||
+        diff_ns(clock_now, s->last_cpu_clock_scan) >= 2000000000LL) {
+        sample_cpu_clocks(s);
+        s->last_cpu_clock_scan = clock_now;
+    }
 }
 
 
@@ -2336,11 +3594,11 @@ static int tuning_apply(Sysfs *s, Target *target, TuningState *t,
 
     bool od_changed = false;
     char cmd[96];
-    snprintf(target->policy, sizeof(target->policy), "manual");
     if (apply_policy(s, "manual") < 0) {
         snprintf(message, cap, "Cannot enter manual power mode: %s", strerror(errno));
         return -1;
     }
+    text_copy(target->policy, sizeof(target->policy), "manual");
 
     if (s->fd_od_w >= 0) {
         if (t->has_sclk) {
@@ -2442,10 +3700,13 @@ static int tuning_reset(Sysfs *s, Target *target, TuningState *t,
     if (t->has_power_cap && t->default_power_cap_w > 0.0) {
         if (write_power_cap(s, t->default_power_cap_w) < 0) rc = -1;
     }
-    snprintf(target->policy, sizeof(target->policy), "profile_standard");
-    target->lock_sclk = false;
-    target->lock_mclk = false;
-    if (apply_policy(s, target->policy) < 0) rc = -1;
+    /* Preserve the watchdog target on driver rejection. Reset may already
+     * have partially succeeded, so retain the partial-failure message. */
+    if (apply_policy(s, "profile_standard") == 0) {
+        text_copy(target->policy, sizeof(target->policy), "profile_standard");
+        target->lock_sclk = false;
+        target->lock_mclk = false;
+    } else rc = -1;
     t->armed = false;
     tuning_refresh(s, t, true);
     snprintf(message, cap, rc == 0 ?
@@ -2780,6 +4041,10 @@ static void sample_kms_state(const Sysfs *s, SessionInfo *si) {
                 strncat(si->plane_allocators,who_short,sizeof(si->plane_allocators)-strlen(si->plane_allocators)-1);
                 first_alloc=false;
             }
+        } else if(strncmp(line,"vrr_enabled=",12)==0 || strncmp(line,"vrr_enabled:",12)==0) {
+            const char *v=line+12;
+            while(*v==' ' || *v=='\t')v++;
+            snprintf(si->vrr_state,sizeof(si->vrr_state),"%s (DRM CRTC)",(*v=='1')?"ENABLED":(*v=='0')?"DISABLED":"UNKNOWN");
         } else if(strncmp(line,"mode: \"",7)==0 && !strstr(line,"mode: \"\":")) {
             const char *q=line+7;
             const char *end=strchr(q,'"');
@@ -2791,7 +4056,11 @@ static void sample_kms_state(const Sysfs *s, SessionInfo *si) {
                 long refresh=-1;
                 if(colon) refresh=strtol(colon+1,NULL,10);
                 char one[96];
-                if(refresh>0)snprintf(one,sizeof(one),"%.70s@%ld",name,refresh);
+                if(refresh>1000) refresh=(refresh+500)/1000; /* DRM reports millihertz on some kernels */
+                if(refresh>0) {
+                    snprintf(one,sizeof(one),"%.70s@%ldHz",name,refresh);
+                    if(!si->refresh[0]) snprintf(si->refresh,sizeof(si->refresh),"%ld Hz (DRM CRTC)",refresh);
+                }
                 else snprintf(one,sizeof(one),"%s",name);
                 if(!strstr(si->kms_modes,one)) {
                     if(!first_mode)strncat(si->kms_modes,", ",sizeof(si->kms_modes)-strlen(si->kms_modes)-1);
@@ -2860,7 +4129,7 @@ static void sample_session(const Gpu *g, const Sysfs *s, SessionInfo *si, const 
 
     /* First reuse the DRM client inventory. If picom/KWin/etc already owns a
        DRM client, that is stronger evidence than an unrelated /proc name scan. */
-    if (cm) {
+    if (cm && (g_settings.compositor_source==COMP_AUTO || g_settings.compositor_source==COMP_DRM)) {
         for (int i=0; i<cm->count && !si->compositor[0]; i++) {
             char label[64];
             if (compositor_process(cm->items[i].name,label,sizeof(label)))
@@ -2868,7 +4137,7 @@ static void sample_session(const Gpu *g, const Sysfs *s, SessionInfo *si, const 
         }
     }
 
-    DIR *pd=opendir("/proc");
+    DIR *pd=(g_settings.compositor_source==COMP_AUTO || g_settings.compositor_source==COMP_PROCESS) ? opendir("/proc") : NULL;
     if(pd) {
         struct dirent *pe;
         while((pe=readdir(pd))) {
@@ -2899,7 +4168,8 @@ static void sample_session(const Gpu *g, const Sysfs *s, SessionInfo *si, const 
     else if (strcasecmp(si->session_type,"wayland") == 0)
         snprintf(si->session_type,sizeof(si->session_type),"Wayland");
     if(!si->desktop[0]) snprintf(si->desktop,sizeof(si->desktop),"unknown");
-    if(!si->compositor[0]) snprintf(si->compositor,sizeof(si->compositor),"unknown (no matching process)");
+    if(g_settings.compositor_source==COMP_OFF) snprintf(si->compositor,sizeof(si->compositor),"Detection disabled");
+    else if(!si->compositor[0]) snprintf(si->compositor,sizeof(si->compositor),"unavailable via selected source");
     si->x11_present_possible = session_is_x11(si);
     si->wayland_present_possible = session_is_wayland(si);
 
@@ -3118,6 +4388,10 @@ typedef struct {
     unsigned long bad;
     unsigned long text_dark;
     bool dirty;
+    /* Scroll only the content viewport. The header and footer never scroll. */
+    int scroll_y;
+    int draw_offset_y;
+    int text_right;
 } Gui;
 
 typedef struct {
@@ -3136,6 +4410,13 @@ static void gui_set_font(Gui *ui, bool bold) {
     if (f) XSetFont(ui->dpy, ui->gc, f->fid);
 }
 
+/* Compact desktop layout: all view bodies use UI_PAGE_Y as their logical origin. */
+enum { UI_MARGIN = 12, UI_GAP = 7, UI_PAGE_Y = 407,
+       UI_CONTENT_TOP = 275, UI_FOOTER_SPACE = 62 };
+
+static int gui_content_bottom(const Gui *ui) { return ui->height - UI_FOOTER_SPACE; }
+static int gui_content_height(const Gui *ui) { return gui_content_bottom(ui) - UI_CONTENT_TOP; }
+
 static void gui_text(Gui *ui, int x, int y, unsigned long color, bool bold,
                      const char *fmt, ...) {
     char buf[512];
@@ -3143,35 +4424,49 @@ static void gui_text(Gui *ui, int x, int y, unsigned long color, bool bold,
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
+    /* Truncate instead of allowing long diagnostic text to spill into other tiles. */
+    XFontStruct *font = bold && ui->font_bold ? ui->font_bold : ui->font;
+    int right = ui->text_right ? ui->text_right : ui->width - UI_MARGIN;
+    int room = right - x;
+    if (room <= 4 || !font) return;
+    int n = (int)strlen(buf);
+    if (XTextWidth(font, buf, n) > room) {
+        const char *dots = "..";
+        int dots_w = XTextWidth(font, dots, 2);
+        while (n > 0 && XTextWidth(font, buf, n) + dots_w > room) n--;
+        if (n <= 0) return;
+        buf[n] = '\0';
+        if (n + 2 < (int)sizeof(buf)) strcat(buf, dots);
+    }
     XSetForeground(ui->dpy, ui->gc, color);
     gui_set_font(ui, bold);
-    XDrawString(ui->dpy, ui->win, ui->gc, x, y, buf, (int)strlen(buf));
+    XDrawString(ui->dpy, ui->win, ui->gc, x, y + ui->draw_offset_y, buf, (int)strlen(buf));
 }
 
 static void gui_fill(Gui *ui, Rect r, unsigned long color) {
     if (r.w <= 0 || r.h <= 0) return;
     XSetForeground(ui->dpy, ui->gc, color);
-    XFillRectangle(ui->dpy, ui->win, ui->gc, r.x, r.y, (unsigned)r.w, (unsigned)r.h);
+    XFillRectangle(ui->dpy, ui->win, ui->gc, r.x, r.y + ui->draw_offset_y, (unsigned)r.w, (unsigned)r.h);
 }
 
 static void gui_outline(Gui *ui, Rect r, unsigned long color) {
     if (r.w <= 0 || r.h <= 0) return;
     XSetForeground(ui->dpy, ui->gc, color);
-    XDrawRectangle(ui->dpy, ui->win, ui->gc, r.x, r.y, (unsigned)(r.w - 1), (unsigned)(r.h - 1));
+    XDrawRectangle(ui->dpy, ui->win, ui->gc, r.x, r.y + ui->draw_offset_y, (unsigned)(r.w - 1), (unsigned)(r.h - 1));
 }
 
-static unsigned long color_luminance(unsigned long c) {
-    /* Extract RGB components from X11 pixel value */
-    unsigned char r = (c >> 16) & 0xFF;
-    unsigned char g = (c >> 8) & 0xFF;
-    unsigned char b = c & 0xFF;
-    /* Relative luminance formula */
-    return (unsigned long)((r * 299 + g * 587 + b * 114) / 1000);
-}
-
-static unsigned long contrast_text_color(Gui *ui, unsigned long bg_color) {
-    /* Return dark text for light backgrounds, light text for dark backgrounds */
-    return color_luminance(bg_color) > 128 ? ui->text_dark : ui->fg;
+/* Outlined light labels remain legible on both filled and unfilled bar sections. */
+static void gui_bar_label(Gui *ui, Rect r, const char *label) {
+    if (!label || !*label) return;
+    int old_right = ui->text_right;
+    ui->text_right = r.x + r.w - 3;
+    XFontStruct *font = ui->font_bold ? ui->font_bold : ui->font;
+    int asc = font ? font->ascent : 10, desc = font ? font->descent : 3;
+    int y = r.y + (r.h + asc - desc) / 2;
+    int x = r.x + 5;
+    gui_text(ui, x+1, y+1, ui->bg, true, "%s", label);
+    gui_text(ui, x, y, ui->fg, true, "%s", label);
+    ui->text_right = old_right;
 }
 
 static void gui_bar(Gui *ui, Rect r, double pct, const char *label) {
@@ -3182,7 +4477,7 @@ static void gui_bar(Gui *ui, Rect r, double pct, const char *label) {
     fill.w = (int)((double)r.w * pct / 100.0);
     gui_fill(ui, fill, ui->accent);
     gui_outline(ui, r, ui->dim);
-    if (label && *label) gui_text(ui, r.x + 6, r.y + r.h - 6, contrast_text_color(ui, ui->accent), true, "%s", label);
+    gui_bar_label(ui, r, label);
 }
 
 static void gui_bar_color(Gui *ui, Rect r, double pct, const char *label,
@@ -3194,7 +4489,7 @@ static void gui_bar_color(Gui *ui, Rect r, double pct, const char *label,
     fill.w = (int)((double)r.w * pct / 100.0);
     gui_fill(ui, fill, fill_color);
     gui_outline(ui, r, ui->dim);
-    if (label && *label) gui_text(ui, r.x + 6, r.y + r.h - 6, contrast_text_color(ui, fill_color), true, "%s", label);
+    gui_bar_label(ui, r, label);
 }
 
 static void gui_bar_color_text(Gui *ui, Rect r, double pct, const char *label,
@@ -3206,7 +4501,8 @@ static void gui_bar_color_text(Gui *ui, Rect r, double pct, const char *label,
     fill.w = (int)((double)r.w * pct / 100.0);
     gui_fill(ui, fill, fill_color);
     gui_outline(ui, r, ui->dim);
-    if (label && *label) gui_text(ui, r.x + 6, r.y + r.h - 6, text_color, true, "%s", label);
+    (void)text_color;
+    gui_bar_label(ui, r, label);
 }
 
 static unsigned long tune_zone_color(Gui *ui, TuneZone zone) {
@@ -3278,6 +4574,77 @@ static int x11_window_name(Display *dpy, Window w, char *out, size_t cap) {
     return -1;
 }
 
+/* Local Arch package metadata: versions and *package* build dates, never guessed
+ * from process names. Non-Arch hosts legitimately show 'unavailable'. */
+static bool pacman_package_info(const char *pkg, char *version, size_t vc, char *built, size_t bc) {
+    DIR *d=opendir("/var/lib/pacman/local");
+    if(!d) return false;
+    char best[MAX_PATH_LEN]="";
+    struct dirent *de;
+    size_t n=strlen(pkg);
+    while((de=readdir(d))) {
+        if(strncmp(de->d_name,pkg,n)!=0 || de->d_name[n]!='-') continue;
+        if(strcmp(de->d_name,best)>0) snprintf(best,sizeof(best),"%s",de->d_name);
+    }
+    closedir(d);
+    if(!best[0]) return false;
+    char path[MAX_PATH_LEN];
+    if(snprintf(path,sizeof(path),"/var/lib/pacman/local/%s/desc",best)>=(int)sizeof(path)) return false;
+    FILE *f=fopen(path,"r");
+    if(!f) return false;
+    char line[256];
+    enum {NONE,VERSION_FIELD,BUILD_FIELD} mode=NONE;
+    while(fgets(line,sizeof(line),f)) {
+        trim(line);
+        if(line[0]=='%') {
+            mode=!strcmp(line,"%VERSION%")?VERSION_FIELD:!strcmp(line,"%BUILDDATE%")?BUILD_FIELD:NONE;
+            continue;
+        }
+        if(!line[0]) continue;
+        if(mode==VERSION_FIELD) text_copy(version,vc,line);
+        else if(mode==BUILD_FIELD) {
+            char *end=NULL;errno=0;
+            long long timestamp=strtoll(line,&end,10);
+            if(!errno && end && !*end && timestamp>0) {
+                time_t ts=(time_t)timestamp;
+                struct tm tm_value;
+                if(gmtime_r(&ts,&tm_value)) strftime(built,bc,"%Y-%m-%d UTC",&tm_value);
+            }
+        }
+        mode=NONE;
+    }
+    fclose(f);
+    return version[0]!=0;
+}
+static void session_package_info(SessionInfo *si, int vendor_release) {
+    const char *xname=xlibre_installed()?"xlibre-xserver":"xorg-server";
+    if(!pacman_package_info(xname,si->xserver_version,sizeof(si->xserver_version),si->xserver_built,sizeof(si->xserver_built)))
+        snprintf(si->xserver_version,sizeof(si->xserver_version),"vendor release %d",vendor_release);
+    const char *sess=strcasestr(si->desktop,"xfce")?"xfce4-session":
+                     strcasestr(si->desktop,"kde")?"plasma-workspace":
+                     strcasestr(si->desktop,"gnome")?"gnome-session":"unknown";
+    if(strcmp(sess,"unknown")) {
+        (void)pacman_package_info(sess,si->session_version,sizeof(si->session_version),si->session_built,sizeof(si->session_built));
+        const char *desktop=strcasestr(si->desktop,"xfce")?"xfdesktop":
+                             strcasestr(si->desktop,"kde")?"plasma-desktop":"gnome-shell";
+        (void)pacman_package_info(desktop,si->desktop_version,sizeof(si->desktop_version),si->desktop_built,sizeof(si->desktop_built));
+    }
+    const char *wm=strcasestr(si->window_manager,"xfwm4")?"xfwm4":
+                   strcasestr(si->window_manager,"openbox")?"openbox":
+                   strcasestr(si->window_manager,"i3")?"i3-wm":
+                   strcasestr(si->window_manager,"kwin")?"kwin-x11":"";
+    if(*wm) (void)pacman_package_info(wm,si->wm_version,sizeof(si->wm_version),si->wm_built,sizeof(si->wm_built));
+    const char *comp=strcasestr(si->compositor,"picom")?"picom":
+                     strcasestr(si->compositor,"xfwm4")?"xfwm4":
+                     strcasestr(si->compositor,"kwin")?"kwin-x11":"";
+    if(*comp) (void)pacman_package_info(comp,si->compositor_version,sizeof(si->compositor_version),si->compositor_built,sizeof(si->compositor_built));
+    if(!si->refresh[0]) snprintf(si->refresh,sizeof(si->refresh),"KMS mode not reported");
+    /* Neither compositing nor Present support proves vsync/buffering is enabled. */
+    snprintf(si->vsync_state,sizeof(si->vsync_state),"unverified (compositor / app-specific)");
+    snprintf(si->buffer_state,sizeof(si->buffer_state),"unverified (driver / application-specific)");
+    if(!si->vrr_state[0]) snprintf(si->vrr_state,sizeof(si->vrr_state),"unreported by DRM state");
+}
+
 static void x11_probe_session(Gui *ui, SessionInfo *si) {
     const char *vendor = ServerVendor(ui->dpy);
     snprintf(si->xserver_vendor, sizeof(si->xserver_vendor), "%s", vendor ? vendor : "unknown");
@@ -3294,7 +4661,7 @@ static void x11_probe_session(Gui *ui, SessionInfo *si) {
     char atom_name[64];
     snprintf(atom_name, sizeof(atom_name), "_NET_WM_CM_S%d", ui->screen);
     Atom cm = XInternAtom(ui->dpy, atom_name, True);
-    if (cm != None) {
+    if (cm != None && (g_settings.compositor_source==COMP_AUTO || g_settings.compositor_source==COMP_X11)) {
         Window owner = XGetSelectionOwner(ui->dpy, cm);
         if (owner != None) {
             pid_t pid = 0;
@@ -3329,6 +4696,7 @@ static void x11_probe_session(Gui *ui, SessionInfo *si) {
         if (data) XFree(data);
     }
     if (!si->window_manager[0]) snprintf(si->window_manager, sizeof(si->window_manager), "unknown");
+    session_package_info(si,VendorRelease(ui->dpy));
 }
 
 static int gui_init(Gui *ui, SessionInfo *si) {
@@ -3341,8 +4709,8 @@ static int gui_init(Gui *ui, SessionInfo *si) {
     }
     ui->screen = DefaultScreen(ui->dpy);
     ui->root = RootWindow(ui->dpy, ui->screen);
-    ui->width = 1100;
-    ui->height = 980;
+    ui->width = 840;
+    ui->height = 660;
     ui->bg = gui_color(ui, "#101214", BlackPixel(ui->dpy, ui->screen));
     ui->panel = gui_color(ui, "#1a1d21", ui->bg);
     ui->panel_alt = gui_color(ui, "#262a2f", ui->panel);
@@ -3364,16 +4732,16 @@ static int gui_init(Gui *ui, SessionInfo *si) {
     XSetWMProtocols(ui->dpy, ui->win, &ui->wm_delete, 1);
     XSizeHints hints = {0};
     hints.flags = PMinSize;
-    hints.min_width = 960;
-    hints.min_height = 900;
+    hints.min_width = 780;
+    hints.min_height = 610;
     XSetWMNormalHints(ui->dpy, ui->win, &hints);
 
     ui->gc = XCreateGC(ui->dpy, ui->win, 0, NULL);
-    ui->font = XLoadQueryFont(ui->dpy, "12x24");
-    if (!ui->font) ui->font = XLoadQueryFont(ui->dpy, "10x20");
+    ui->font = XLoadQueryFont(ui->dpy, "8x13");
+    if (!ui->font) ui->font = XLoadQueryFont(ui->dpy, "9x15");
     if (!ui->font) ui->font = XLoadQueryFont(ui->dpy, "fixed");
-    ui->font_bold = XLoadQueryFont(ui->dpy, "12x24bold");
-    if (!ui->font_bold) ui->font_bold = XLoadQueryFont(ui->dpy, "10x20bold");
+    ui->font_bold = XLoadQueryFont(ui->dpy, "8x13bold");
+    if (!ui->font_bold) ui->font_bold = XLoadQueryFont(ui->dpy, "9x15bold");
     if (!ui->font_bold) ui->font_bold = ui->font;
     gui_set_font(ui, false);
     XMapWindow(ui->dpy, ui->win);
@@ -3394,94 +4762,108 @@ static void gui_close(Gui *ui) {
 }
 
 static const char *view_name(View v) {
-    static const char *names[] = {"Home", "Clients", "Power", "Tuning", "Desktop", "Events", "Trace", "Help", "About"};
+    static const char *names[] = {"Home", "Clients", "Power", "Tuning", "Desktop", "Events", "Trace", "Settings", "About", "?"};
     return (v >= VIEW_DASHBOARD && v <= VIEW_ABOUT) ? names[v] : "Home";
 }
 
+static Rect compact_row_rect(const Gui *ui, int idx, int count,
+                             int y, int h, int gap, int preferred_w) {
+    int full = ui->width - UI_MARGIN * 2;
+    int w = (full - (count - 1) * gap) / count;
+    if (w > preferred_w) w = preferred_w;
+    int group = count * w + (count - 1) * gap;
+    int x = (ui->width - group) / 2 + idx * (w + gap);
+    return (Rect){x, y, w, h};
+}
+
 static Rect tab_rect(const Gui *ui, int idx) {
-    int count = 9, gap = 4, x0 = 12, y = 335, h = 30;
-    int w = (ui->width - x0 * 2 - gap * (count - 1)) / count;
-    return (Rect){x0 + idx * (w + gap), y, w, h};
+    int total = ui->width - 2*UI_MARGIN;
+    int help_w=26, gap=4;
+    int w=(total-help_w-9*gap)/9;
+    return (Rect){UI_MARGIN+idx*(w+gap),248,w,23};
+}
+static Rect help_rect(const Gui *ui) {
+    int total=ui->width-2*UI_MARGIN, gap=4, help_w=26;
+    int w=(total-help_w-9*gap)/9;
+    return (Rect){UI_MARGIN+9*(w+gap),248,help_w,23};
 }
 
 static Rect control_rect(const Gui *ui, int idx) {
-    int count = 5, gap = 4, x0 = 12, y = ui->height - 72, h = 26;
-    int w = (ui->width - x0 * 2 - gap * (count - 1)) / count;
-    return (Rect){x0 + idx * (w + gap), y, w, h};
+    return compact_row_rect(ui, idx, 5, ui->height - 33, 23, 6, 135);
 }
 
 static Rect mode_rect(const Gui *ui, int idx) {
-    int count = 8, gap = 3, x0 = 12, y = 78, h = 29;
-    int w = (ui->width - x0 * 2 - gap * (count - 1)) / count;
-    return (Rect){x0 + idx * (w + gap), y, w, h};
+    return compact_row_rect(ui, idx, 8, 56, 23, 3, 103);
 }
 
 static Rect workflow_rect(const Gui *ui, int idx) {
-    int w = 130, h = 34, gap = 8;
-    int x = ui->width - 16 - w - gap - w + idx * (w + gap);
-    return (Rect){x, 10, w, h};
+    int w = 102, h = 22, gap = 5;
+    return (Rect){ui->width - UI_MARGIN - (2 - idx) * (w + gap) + gap, 8, w, h};
 }
 
-static Rect token_source_rect(const Gui *ui) {
-    int w = 140, h = 34;
-    int x = ui->width - 16 - 130 - 8 - 130 - 8 - w;
-    return (Rect){x, 10, w, h};
+static Rect tuning_tile_rect(const Gui *ui, int row) {
+    int gap = UI_GAP, w = (ui->width - UI_MARGIN * 2 - 2 * gap) / 3;
+    return (Rect){UI_MARGIN + (row % 3) * (w + gap), 533 + (row / 3) * 100, w, 91};
 }
 
 static Rect tuning_minus_rect(const Gui *ui, int row) {
-    return (Rect){ui->width - 190, 520 + row * 68, 72, 30};
+    Rect r = tuning_tile_rect(ui, row);
+    return (Rect){r.x + r.w - 53, r.y + 30, 20, 20};
 }
 
 static Rect tuning_plus_rect(const Gui *ui, int row) {
-    return (Rect){ui->width - 105, 520 + row * 68, 72, 30};
+    Rect r = tuning_tile_rect(ui, row);
+    return (Rect){r.x + r.w - 28, r.y + 30, 20, 20};
 }
 
 static Rect tuning_action_rect(const Gui *ui, int idx) {
-    int count = 4, gap = 8, x0 = 20, y = 805, h = 34;
-    int w = (ui->width - x0 * 2 - gap * (count - 1)) / count;
-    return (Rect){x0 + idx * (w + gap), y, w, h};
+    Rect safe=tuning_tile_rect(ui,5);
+    int w=(safe.w-24)/2;
+    return (Rect){safe.x+8+(idx%2)*(w+8),safe.y+29+(idx/2)*28,w,22};
 }
 
 static void draw_button(Gui *ui, Rect r, const char *text, bool active) {
     gui_fill(ui, r, active ? ui->accent : ui->panel_alt);
     gui_outline(ui, r, active ? ui->fg : ui->dim);
-    int tx = r.x + 7;
-    int ty = r.y + r.h - 8;
+    XFontStruct *font = active && ui->font_bold ? ui->font_bold : ui->font;
+    int len = (int)strlen(text);
+    int text_w = font ? XTextWidth(font, text, len) : len * 8;
+    int ascent = font ? font->ascent : 10;
+    int descent = font ? font->descent : 3;
+    int tx = r.x + (r.w - text_w) / 2;
+    int ty = r.y + (r.h + ascent - descent) / 2;
+    if (tx < r.x + 3) tx = r.x + 3;
+    int old_right = ui->text_right;
+    ui->text_right = r.x + r.w - 3;
     gui_text(ui, tx, ty, active ? ui->bg : ui->fg, active, "%s", text);
+    ui->text_right = old_right;
 }
+
 
 static void draw_header(Gui *ui, const Gpu *g, Sysfs *s, const Target *t,
                         const PowerTelemetry *p, const SystemTelemetry *sys,
                         const Stats *st) {
-    gui_text(ui, 16, 25, ui->fg, true, "%s", g->full_name);
+    ui->text_right = workflow_rect(ui,0).x - 8;
+    gui_text(ui, UI_MARGIN, 19, ui->fg, true, "%s", g->full_name);
+    ui->text_right = 0;
 
     /* Workflow mode buttons */
     Rect ai_btn = workflow_rect(ui, 0);
     Rect game_btn = workflow_rect(ui, 1);
     bool ai_active = (g_workflow == WORKFLOW_AI);
     bool game_active = (g_workflow == WORKFLOW_GAMING);
-    draw_button(ui, ai_btn, "AI Workflow", ai_active);
-    draw_button(ui, game_btn, "Gaming Workflow", game_active);
+    draw_button(ui, ai_btn, "AI", ai_active);
+    draw_button(ui, game_btn, "GAMING", game_active);
 
-    /* Token source button */
-    Rect tok_btn = token_source_rect(ui);
-    char tok_label[64];
-    switch (g_token_source) {
-        case TOKEN_SOURCE_HEURISTIC: snprintf(tok_label, sizeof(tok_label), "Tok: Heuristic"); break;
-        case TOKEN_SOURCE_LLAMA: snprintf(tok_label, sizeof(tok_label), "Tok: llama.cpp"); break;
-        case TOKEN_SOURCE_OLLAMA: snprintf(tok_label, sizeof(tok_label), "Tok: Ollama"); break;
-        case TOKEN_SOURCE_VLLM: snprintf(tok_label, sizeof(tok_label), "Tok: vLLM"); break;
-        default: snprintf(tok_label, sizeof(tok_label), "Tok: Auto"); break;
-    }
-    draw_button(ui, tok_btn, tok_label, false);
-    gui_text(ui, 16, 47, ui->dim, false,
+    /* Data sources are configured in Settings (not the header). */
+    gui_text(ui, UI_MARGIN, 35, ui->dim, false,
              "%s  |  PCI %s  |  ID 1002:%s  |  VRAM %.1f GiB",
              g->card_name, g->pci_addr, g->device_id, g->vram_bytes / 1073741824.0);
 
     char actual[128] = "unknown";
     (void)read_fd_text(s->fd_policy_r, actual, sizeof(actual));
     unsigned long lock_color = strcmp(actual, t->policy) == 0 ? ui->good : ui->bad;
-    gui_text(ui, 16, 69, lock_color, true,
+    gui_text(ui, UI_MARGIN, 50, lock_color, true,
              "POWER MODE   target %s   actual %s   %s   corrections %llu",
              t->policy, actual, t->enabled ? "LOCKED" : "PAUSED",
              (unsigned long long)st->corrections);
@@ -3498,7 +4880,7 @@ static void draw_header(Gui *ui, const Gpu *g, Sysfs *s, const Target *t,
     if (p->power_cap_max_w > 1.0 && p->power_cap_max_w < power_scale)
         power_scale = p->power_cap_max_w;
     if (power_scale < 400.0) power_scale = 400.0;
-    Rect power_bar = {16, 119, ui->width - 32, 42};
+    Rect power_bar = {UI_MARGIN, 86, ui->width - UI_MARGIN * 2, 26};
     double power_pct = p->power_w >= 0.0 ? p->power_w * 100.0 / power_scale : 0.0;
     if (p->power_w >= 0.0 && p->power_cap_w > 0.0)
         snprintf(label, sizeof(label), "BOARD POWER   %.1f W    POWER CAP %.0f W    firmware scale %.0f W",
@@ -3514,29 +4896,43 @@ static void draw_header(Gui *ui, const Gpu *g, Sysfs *s, const Target *t,
     else
         gui_bar_color(ui, power_bar, power_pct, label, ui->accent);
 
-    /* Temperatures are deliberately prominent and always visible. */
+    /* Label the physical source explicitly; temp2 is junction, not another edge.
+     * Tctl is read independently of the preferred CPU die sensor (Tdie). */
     double temp_values[MAX_GPU_TEMPS + 1];
     long temp_crit[MAX_GPU_TEMPS + 1];
     long temp_emergency[MAX_GPU_TEMPS + 1];
     const char *temp_names[MAX_GPU_TEMPS + 1];
+    const char *const gpu_names[] = {"GPU Edge (t1)", "GPU Junction (t2)", "GPU Mem (t3)"};
     int nt = 0;
     for (int i = 0; i < MAX_GPU_TEMPS; i++) {
         if (p->temps_c[i] < 0.0) continue;
         temp_values[nt] = p->temps_c[i];
         temp_crit[nt] = s->temp_crit_mc[i];
         temp_emergency[nt] = s->temp_emergency_mc[i];
-        temp_names[nt] = s->temp_label[i][0] ? s->temp_label[i] : "GPU";
+        /* The kernel's actual label wins when it differs from the standard mapping. */
+        const char *sensor_label = s->temp_label[i];
+        if (sensor_label[0] && strcasecmp(sensor_label, "edge") && strcasecmp(sensor_label, "junction") &&
+            strcasecmp(sensor_label, "hotspot") && strcasecmp(sensor_label, "mem") &&
+            strcasecmp(sensor_label, "memory") && strcasecmp(sensor_label, "GPU Edge") &&
+            strcasecmp(sensor_label, "GPU Junction") && strcasecmp(sensor_label, "GPU Memory"))
+            temp_names[nt] = sensor_label;
+        else temp_names[nt] = gpu_names[i];
         nt++;
     }
-    if (sys->cpu_temp_c >= 0.0 && nt < MAX_GPU_TEMPS + 1) {
-        temp_values[nt] = sys->cpu_temp_c;
+    double cpu_label_temp = sys->cpu_tctl_c >= 0.0 ? sys->cpu_tctl_c : sys->cpu_temp_c;
+    if (cpu_label_temp >= 0.0 && nt < MAX_GPU_TEMPS + 1) {
+        temp_values[nt] = cpu_label_temp;
         temp_crit[nt] = sys->cpu_temp_crit_mc;
         temp_emergency[nt] = -1;
-        temp_names[nt] = sys->cpu_temp_label[0] ? sys->cpu_temp_label : "CPU";
+        temp_names[nt] = sys->cpu_tctl_c >= 0.0 ?
+                         (sys->cpu_tctl_label[0] ? sys->cpu_tctl_label : "CPU Tctl (hwmon)") :
+                         strcasestr(sys->cpu_temp_label, "tdie") ? "CPU Tdie (hwmon)" : "CPU temp (hwmon)";
         nt++;
     }
 
-    int margin = 16, gap = 7;
+    int margin = UI_MARGIN, gap = UI_GAP;
+    /* Bars start below the board power bar */
+    int bar_top = 118;
     if (nt > 0) {
         int tw = (ui->width - margin * 2 - gap * (nt - 1)) / nt;
         for (int i = 0; i < nt; i++) {
@@ -3545,7 +4941,7 @@ static void draw_header(Gui *ui, const Gpu *g, Sysfs *s, const Target *t,
             if (max_c < 80.0) max_c = 110.0;
             snprintf(label, sizeof(label), "%s   %.1f C", temp_names[i], temp_values[i]);
             TuneZone z = temperature_zone(temp_values[i], temp_crit[i], temp_emergency[i]);
-            Rect temp_bar = {margin + i * (tw + gap), 170, tw, 31};
+            Rect temp_bar = {margin + i * (tw + gap), bar_top, tw, 21};
             unsigned long fill = tune_zone_color(ui, z);
             if (z == TUNE_ZONE_SAFE || z == TUNE_ZONE_WARNING)
                 gui_bar_color_text(ui, temp_bar, temp_values[i] * 100.0 / max_c, label, fill, ui->text_dark);
@@ -3553,14 +4949,14 @@ static void draw_header(Gui *ui, const Gpu *g, Sysfs *s, const Target *t,
                 gui_bar_color(ui, temp_bar, temp_values[i] * 100.0 / max_c, label, fill);
         }
     } else {
-        gui_bar_color(ui, (Rect){margin, 170, ui->width - margin * 2, 31}, 0.0,
+        gui_bar_color(ui, (Rect){margin, bar_top, ui->width - margin * 2, 21}, 0.0,
                       "Temperatures unavailable", ui->dim);
     }
 
     const int half_gap = 8;
     int half = (ui->width - margin * 2 - half_gap) / 2;
-    Rect left = {margin, 211, half, 22};
-    Rect right = {margin + half + half_gap, 211, half, 22};
+    Rect left = {margin, bar_top + 26, half, 19};
+    Rect right = {margin + half + half_gap, bar_top + 26, half, 19};
 
     snprintf(label, sizeof(label), "GPU load %d%%", p->gpu_busy >= 0 ? p->gpu_busy : 0);
     gui_bar(ui, left, p->gpu_busy >= 0 ? p->gpu_busy : 0.0, label);
@@ -3569,14 +4965,14 @@ static void draw_header(Gui *ui, const Gpu *g, Sysfs *s, const Target *t,
              p->vram_used / 1073741824.0, g->vram_bytes / 1073741824.0, vram_pct);
     gui_bar(ui, right, vram_pct, label);
 
-    left.y = right.y = 239;
+    left.y = right.y = bar_top + 49;
     snprintf(label, sizeof(label), "CPU %.1f%%  (%u threads)", sys->cpu_pct, sys->cpu_threads);
     gui_bar(ui, left, sys->cpu_pct, label);
     snprintf(label, sizeof(label), "System RAM %.2f / %.2f GiB (%.1f%%)",
              sys->ram_used_bytes / 1073741824.0, sys->ram_total_bytes / 1073741824.0, sys->ram_pct);
     gui_bar(ui, right, sys->ram_pct, label);
 
-    left.y = right.y = 267;
+    left.y = right.y = bar_top + 72;
     double voltage_pct = p->voltage_v >= 0.0 ? p->voltage_v * 100.0 / VOLTAGE_BAR_MAX_V : 0.0;
     if (p->voltage_v >= 0.0)
         snprintf(label, sizeof(label), "%s %.3f V",
@@ -3599,245 +4995,369 @@ static void draw_header(Gui *ui, const Gpu *g, Sysfs *s, const Target *t,
     else snprintf(fan, sizeof(fan), "n/a");
     if (p->gfx_hz >= 0) snprintf(gfx, sizeof(gfx), "%.0f MHz", p->gfx_hz / 1000000.0); else snprintf(gfx, sizeof(gfx), "n/a");
     if (p->mem_hz >= 0) snprintf(mem, sizeof(mem), "%.0f MHz", p->mem_hz / 1000000.0); else snprintf(mem, sizeof(mem), "n/a");
-    gui_text(ui, 16, 314, ui->fg, false,
+    gui_text(ui, UI_MARGIN, 236, ui->fg, false,
              "Fan %s   GFX %s   MEM %s   watchdog %.0f Hz", fan, gfx, mem, st->loop_hz);
 }
 
 static void draw_tabs(Gui *ui, View view) {
-    for (int i = 0; i < 9; i++) draw_button(ui, tab_rect(ui, i), view_name((View)i), view == (View)i);
+    for (int i=0;i<9;i++) draw_button(ui,tab_rect(ui,i),view_name((View)i),view==(View)i);
+    draw_button(ui,help_rect(ui),"?",view==VIEW_HELP);
 }
 
 static void panel_title(Gui *ui, Rect r, const char *title) {
     gui_fill(ui, r, ui->panel);
     gui_outline(ui, r, ui->panel_alt);
-    gui_text(ui, r.x + 10, r.y + 20, ui->accent, true, "%s", title);
+    ui->text_right = r.x + r.w - 8;
+    gui_text(ui, r.x + 8, r.y + 17, ui->accent, true, "%s", title);
 }
 
-/* GAMING MODE DASHBOARD */
+/* Read-only gaming telemetry. No FPS or hardware feature statuses are inferred
+ * from the UI's own redraw rate or unsupported kernel interfaces. */
 static void draw_gaming_dashboard(Gui *ui, const Gpu *g, const Sysfs *s,
-                                  const PowerTelemetry *p, const SystemTelemetry *sys,
-                                  const FrametimeStats *ft) {
-    int margin = 12, gap = 10;
-    int top = 377;
+                                  const PowerTelemetry *p, const SystemTelemetry *sys) {
+    int margin=UI_MARGIN, gap=UI_GAP, tile_h=96;
+    int w=(ui->width-2*margin-2*gap)/3;
+    int top=UI_PAGE_Y;
+    Rect r[3]={{margin, top, w, tile_h},
+               {margin+w+gap, top, w, tile_h},
+               {margin+2*(w+gap), top, w, tile_h}};
     char label[128];
+    double watts_scale=p->power_cap_w>0.0 ? p->power_cap_w : 400.0;
+    if (watts_scale<200) watts_scale=200;
 
-    /* Row 1: GPU Power | GPU Temp | GPU Memory */
-    int w = (ui->width - margin * 2 - gap * 2) / 3;
-    int h = 80;
-    Rect r[3] = {
-        {margin, top, w, h},
-        {margin + w + gap, top, w, h},
-        {margin + 2*(w + gap), top, w, h}
-    };
+    /* Row 1: both measured powers, individual GPU temperatures, free memory. */
+    panel_title(ui,r[0],"POWER CONSUMPTION");
+    if (p->power_w>=0.0) {
+        if (p->power_cap_w > 0.0)
+            snprintf(label,sizeof(label),"GPU %.0f / %.0f W",p->power_w,p->power_cap_w);
+        else snprintf(label,sizeof(label),"GPU %.0f W (board)",p->power_w);
+        gui_bar_color(ui,(Rect){r[0].x+9,r[0].y+31,w-18,21},p->power_w*100.0/watts_scale,label,ui->accent);
+    } else gui_text(ui,r[0].x+9,r[0].y+47,ui->dim,false,"GPU power unavailable");
+    if (sys->cpu_power_w>=0.0) {
+        snprintf(label,sizeof(label),"CPU %.0f W (sensor)",sys->cpu_power_w);
+        /* CPU is an independent 200 W reference scale, not the GPU's power cap. */
+        gui_bar_color(ui,(Rect){r[0].x+9,r[0].y+61,w-18,21},sys->cpu_power_w/2.0,label,ui->accent);
+    } else gui_text(ui,r[0].x+9,r[0].y+76,ui->dim,false,"CPU power: sensor unavailable");
 
-    panel_title(ui, r[0], "GPU POWER");
-    if (p->power_w >= 0.0) {
-        double power_pct = p->power_w * 100.0 / POWER_BAR_MAX_W;
-        snprintf(label, sizeof(label), "%.1f W", p->power_w);
-        gui_bar_color(ui, (Rect){r[0].x+10, r[0].y+35, w-20, 22}, power_pct, label, ui->accent);
-    } else {
-        gui_text(ui, r[0].x+10, r[0].y+45, ui->dim, false, "unavailable");
+    panel_title(ui,r[1],"GPU TEMPERATURE");
+    static const char *const temp_names[3]={"EDGE [temp1]","JUNCTION [temp2]","MEM [temp3]"};
+    int shown=0;
+    for (int i=0;i<MAX_GPU_TEMPS;i++) {
+        if (p->temps_c[i]<0.0) continue;
+        TuneZone zone=temperature_zone(p->temps_c[i],s->temp_crit_mc[i],s->temp_emergency_mc[i]);
+        double limit=s->temp_emergency_mc[i]>0 ? s->temp_emergency_mc[i]/1000.0 :
+                     s->temp_crit_mc[i]>0 ? s->temp_crit_mc[i]/1000.0+10 : 110;
+        if (limit<80) limit=110;
+        snprintf(label,sizeof(label),"%s %.0f C",temp_names[i],p->temps_c[i]);
+        gui_bar_color(ui,(Rect){r[1].x+9,r[1].y+29+i*22,w-18,18},
+                      p->temps_c[i]*100.0/limit,label,tune_zone_color(ui,zone));
+        shown++;
     }
+    if (!shown) gui_text(ui,r[1].x+9,r[1].y+45,ui->dim,false,"GPU sensors unavailable");
 
-    panel_title(ui, r[1], "GPU JUNCTION TEMP");
-    if (p->temp_c >= 0.0) {
-        snprintf(label, sizeof(label), "%.1f C", p->temp_c);
-        TuneZone z = temperature_zone(p->temp_c * 1000.0, s->temp_crit_mc[0], s->temp_emergency_mc[0]);
-        unsigned long fill = tune_zone_color(ui, z);
-        gui_bar_color_text(ui, (Rect){r[1].x+10, r[1].y+35, w-20, 22}, p->temp_c, label, fill, ui->text_dark);
-    } else {
-        gui_text(ui, r[1].x+10, r[1].y+45, ui->dim, false, "unavailable");
-    }
+    panel_title(ui,r[2],"MEMORY");
+    if (g->vram_bytes>0 && p->vram_usage_valid && p->vram_used<=g->vram_bytes) {
+        uint64_t free=g->vram_bytes-p->vram_used;
+        snprintf(label,sizeof(label),"GPU free %.1f / %.1f GiB",free/1073741824.0,g->vram_bytes/1073741824.0);
+        gui_bar_color(ui,(Rect){r[2].x+9,r[2].y+31,w-18,21},
+                      free*100.0/g->vram_bytes,label,free*100.0/g->vram_bytes<10?ui->warn:ui->accent);
+    } else gui_text(ui,r[2].x+9,r[2].y+47,ui->dim,false,"GPU headroom unavailable");
+    if (sys->ram_total_bytes && sys->ram_used_bytes<=sys->ram_total_bytes) {
+        uint64_t free=sys->ram_total_bytes-sys->ram_used_bytes;
+        snprintf(label,sizeof(label),"RAM free %.1f / %.1f GiB",free/1073741824.0,sys->ram_total_bytes/1073741824.0);
+        gui_bar_color(ui,(Rect){r[2].x+9,r[2].y+61,w-18,21},
+                      free*100.0/sys->ram_total_bytes,label,ui->accent);
+    } else gui_text(ui,r[2].x+9,r[2].y+76,ui->dim,false,"System RAM headroom n/a");
 
-    panel_title(ui, r[2], "GPU MEMORY");
-    if (g->vram_bytes > 0) {
-        double vram_pct = (double)p->vram_used * 100.0 / (double)g->vram_bytes;
-        snprintf(label, sizeof(label), "%.2f / %.2f GiB", p->vram_used/1073741824.0, g->vram_bytes/1073741824.0);
-        gui_bar_color(ui, (Rect){r[2].x+10, r[2].y+35, w-20, 22}, vram_pct, label, ui->accent);
-    } else {
-        gui_text(ui, r[2].x+10, r[2].y+45, ui->dim, false, "unavailable");
-    }
+    top+=tile_h+gap;
+    for(int i=0;i<3;i++) r[i].y=top;
+    panel_title(ui,r[0],"GPU ENGINE UTILIZATION");
+    if (p->gpu_busy>=0) {
+        snprintf(label,sizeof(label),"Graphics/compute %d%%",p->gpu_busy);
+        gui_bar_color(ui,(Rect){r[0].x+9,r[0].y+31,w-18,19},p->gpu_busy,label,ui->accent);
+    } else gui_text(ui,r[0].x+9,r[0].y+45,ui->dim,false,"GPU busy unavailable");
+    if (p->mem_busy>=0) {
+        snprintf(label,sizeof(label),"Memory controller %d%%",p->mem_busy);
+        gui_bar_color(ui,(Rect){r[0].x+9,r[0].y+59,w-18,19},p->mem_busy,label,ui->accent);
+    } else gui_text(ui,r[0].x+9,r[0].y+75,ui->dim,false,"Memory busy unavailable");
 
-    /* Row 2: Frametimes | CPU Load | System Memory */
-    top += h + gap;
-    r[0].y = r[1].y = r[2].y = top;
-
-    panel_title(ui, r[0], "FRAMETIMES");
-    if (ft->count > 0) {
-        gui_text(ui, r[0].x+10, r[0].y+40, ui->fg, false, "Avg: %.2f ms", ft->avg_ms);
-        gui_text(ui, r[0].x+10, r[0].y+60, ui->fg, false, "1%%: %.2f  0.1%%: %.2f  0.01%%: %.2f",
-                 ft->p1_ms, ft->p01_ms, ft->p001_ms);
-        /* Frametime chart (mini bar chart) */
-        int chart_y = r[0].y + 70;
-        int chart_w = w - 20;
-        int chart_h = 15;
-        for (int i = 0; i < 20; i++) {
-            int idx = (ft->head - 1 - i + FRAMETIME_HISTORY_SIZE) % FRAMETIME_HISTORY_SIZE;
-            if (idx < 0 || idx >= ft->count) break;
-            double t = ft->times_ms[idx];
-            int bar_h = (int)(t * chart_h / 33.0);  /* Scale to ~33ms (30fps) */
-            if (bar_h > chart_h) bar_h = chart_h;
-            if (bar_h < 1) bar_h = 1;
-            Rect bar = {r[0].x + 10 + i * (chart_w / 20), chart_y + chart_h - bar_h, chart_w / 20 - 1, bar_h};
-            gui_fill(ui, bar, ui->accent);
-        }
-    } else {
-        gui_text(ui, r[0].x+10, r[0].y+45, ui->dim, false, "No frametime data");
-    }
-
-    panel_title(ui, r[1], "CPU LOAD PER CORE");
-    int core_w = (w - 30) / 4;
-    int core_y = r[1].y + 35;
-    int max_cores = sys->cpu_cores.core_count;
-    if (max_cores > 8) max_cores = 8;
-    for (int i = 0; i < max_cores; i++) {
-        int col = i % 4;
-        int row = i / 4;
-        int cx = r[1].x + 10 + col * (core_w + 8);
-        int cy = core_y + row * 16;
-        snprintf(label, sizeof(label), "C%d %.0f%%", i, sys->cpu_cores.load_pct[i]);
-        gui_text(ui, cx, cy, ui->fg, false, label);
-        /* Mini bar */
-        double load_pct = sys->cpu_cores.load_pct[i];
-        if (load_pct > 100.0) load_pct = 100.0;
-        gui_bar_color(ui, (Rect){cx, cy + 2, core_w - 10, 4}, load_pct, "", ui->accent);
-    }
-
-    panel_title(ui, r[2], "SYSTEM MEMORY");
-    if (sys->ram_total_bytes > 0) {
-        snprintf(label, sizeof(label), "%.2f / %.2f GiB (%.1f%%)",
-                 sys->ram_used_bytes/1073741824.0, sys->ram_total_bytes/1073741824.0, sys->ram_pct);
-        gui_bar_color(ui, (Rect){r[2].x+10, r[2].y+35, w-20, 22}, sys->ram_pct, label, ui->accent);
-    }
-
-    /* Row 3: CPU Temp | Memory Temp | Input Latency */
-    top += h + gap;
-    r[0].y = r[1].y = r[2].y = top;
-
-    panel_title(ui, r[0], "CPU TEMP / POWER");
-    if (sys->cpu_temp_c >= 0.0) {
-        snprintf(label, sizeof(label), "Tctl: %.1f C", sys->cpu_temp_c);
-        TuneZone z = temperature_zone(sys->cpu_temp_c * 1000.0, sys->cpu_temp_crit_mc, -1);
-        unsigned long fill = tune_zone_color(ui, z);
-        gui_bar_color_text(ui, (Rect){r[0].x+10, r[0].y+35, w-20, 22}, sys->cpu_temp_c, label, fill, ui->text_dark);
-    } else {
-        gui_text(ui, r[0].x+10, r[0].y+45, ui->dim, false, "temp unavailable");
-    }
-    /* Show CCX temps if available */
-    int ccx_y = r[0].y + 60;
-    for (int i = 0; i < sys->cpu_ccx_temp_count && i < 2; i++) {
-        if (sys->cpu_ccx_temp_c[i] >= 0.0) {
-            snprintf(label, sizeof(label), "%s: %.1f C", sys->cpu_ccx_temp_labels[i], sys->cpu_ccx_temp_c[i]);
-            gui_text(ui, r[0].x+10, ccx_y, ui->fg, false, label);
-            ccx_y += 16;
+    panel_title(ui,r[1],"CPU LOAD PER CORE");
+    int max_cores=sys->cpu_cores.core_count;
+    if (max_cores>8) max_cores=8;
+    if (max_cores<=0) gui_text(ui,r[1].x+9,r[1].y+45,ui->dim,false,"CPU load unavailable");
+    else {
+        int bw=(w-20-3*5)/4;
+        for (int i=0;i<max_cores;i++) {
+            int x=r[1].x+10+(i%4)*(bw+5), y=r[1].y+32+(i/4)*24;
+            snprintf(label,sizeof(label),"C%d %.0f%%",i,sys->cpu_cores.load_pct[i]);
+            gui_bar_color(ui,(Rect){x,y,bw,19},sys->cpu_cores.load_pct[i],label,ui->accent);
         }
     }
-    /* CPU power */
-    if (sys->cpu_power_w >= 0.0) {
-        snprintf(label, sizeof(label), "Power: %.1f W", sys->cpu_power_w);
-    } else {
-        double cpu_power_w = (sys->cpu_pct / 100.0) * 120.0;
-        snprintf(label, sizeof(label), "Power: ~%.0f W (est)", cpu_power_w);
-    }
-    gui_text(ui, r[0].x+10, ccx_y, ui->fg, false, label);
-
-    panel_title(ui, r[1], "MOTHERBOARD TEMP");
-    if (sys->mb_temp_count > 0 && sys->mb_temp_c[0] >= 0.0) {
-        snprintf(label, sizeof(label), "%.1f C", sys->mb_temp_c[0]);
-        gui_bar_color_text(ui, (Rect){r[1].x+10, r[1].y+35, w-20, 22}, sys->mb_temp_c[0], label, ui->accent, ui->text_dark);
-        if (sys->mb_temp_count > 1) {
-            for (int i = 1; i < sys->mb_temp_count; i++) {
-                if (sys->mb_temp_c[i] >= 0.0) {
-                    snprintf(label, sizeof(label), "%s: %.1f C", sys->mb_temp_labels[i], sys->mb_temp_c[i]);
-                    gui_text(ui, r[1].x+10, r[1].y+65 + (i-1)*18, ui->fg, false, label);
-                }
-            }
+    panel_title(ui,r[2],"CPU CLOCKS");
+    if (sys->cpu_clock_count>0) {
+        double scale=sys->cpu_clock_cap_mhz>0?sys->cpu_clock_cap_mhz:sys->cpu_clock_max_mhz;
+        const double f[]={sys->cpu_clock_min_mhz,sys->cpu_clock_avg_mhz,sys->cpu_clock_max_mhz};
+        static const char *const names[]={"Min","Avg","Max"};
+        for(int i=0;i<3;i++) {
+            snprintf(label,sizeof(label),"%s %.0f MHz",names[i],f[i]);
+            gui_bar_color(ui,(Rect){r[2].x+9,r[2].y+29+i*22,w-18,18},f[i]*100.0/scale,label,ui->accent);
         }
-    } else {
-        gui_text(ui, r[1].x+10, r[1].y+45, ui->dim, false, "unavailable");
-    }
+    } else gui_text(ui,r[2].x+9,r[2].y+45,ui->dim,false,"CPU cpufreq unavailable");
 
-    panel_title(ui, r[2], "INPUT LATENCY");
-    if (sys->input_latency_ms > 0.0) {
-        snprintf(label, sizeof(label), "%.2f ms", sys->input_latency_ms);
-        gui_text(ui, r[2].x+10, r[2].y+45, ui->fg, false, label);
-    } else {
-        gui_text(ui, r[2].x+10, r[2].y+45, ui->dim, false, "unavailable");
+    top+=tile_h+gap;
+    for(int i=0;i<3;i++) r[i].y=top;
+    panel_title(ui,r[0],"CPU TEMPERATURE");
+    if (sys->cpu_tctl_c>=0.0) {
+        snprintf(label,sizeof(label),"Tctl [%s] %.1f C",
+                 strcasestr(sys->cpu_tctl_label,"zenpower")?"zenpower":"k10temp",sys->cpu_tctl_c);
+        gui_bar_color(ui,(Rect){r[0].x+9,r[0].y+31,w-18,20},sys->cpu_tctl_c,label,ui->accent);
+    } else gui_text(ui,r[0].x+9,r[0].y+45,ui->dim,false,"Tctl unavailable");
+    if (sys->cpu_temp_c>=0.0) {
+        snprintf(label,sizeof(label),"%s %.1f C",sys->cpu_temp_label[0]?sys->cpu_temp_label:"CPU",sys->cpu_temp_c);
+        gui_bar_color(ui,(Rect){r[0].x+9,r[0].y+61,w-18,19},sys->cpu_temp_c,label,ui->accent);
     }
+    panel_title(ui,r[1],"MOTHERBOARD TEMP");
+    if (sys->mb_temp_count>0) {
+        int show=sys->mb_temp_count>3?3:sys->mb_temp_count;
+        for(int i=0;i<show;i++) {
+            if (sys->mb_temp_c[i]<0.0) continue;
+            snprintf(label,sizeof(label),"%s %.1f C",sys->mb_temp_labels[i],sys->mb_temp_c[i]);
+            gui_bar_color(ui,(Rect){r[1].x+9,r[1].y+29+i*22,w-18,18},sys->mb_temp_c[i],label,ui->accent);
+        }
+    } else gui_text(ui,r[1].x+9,r[1].y+45,ui->dim,false,"No motherboard sensors");
+    panel_title(ui,r[2],"GPU CLOCKS / FAN");
+    if (p->gfx_hz>=0) gui_text(ui,r[2].x+9,r[2].y+36,ui->fg,false,"GFX %.0f MHz",p->gfx_hz/1e6);
+    else gui_text(ui,r[2].x+9,r[2].y+36,ui->dim,false,"GFX clock unavailable");
+    if (p->mem_hz>=0) gui_text(ui,r[2].x+9,r[2].y+57,ui->fg,false,"VRAM %.0f MHz",p->mem_hz/1e6);
+    else gui_text(ui,r[2].x+9,r[2].y+57,ui->dim,false,"VRAM clock unavailable");
+    if (p->fan_rpm>=0) gui_text(ui,r[2].x+9,r[2].y+77,ui->fg,false,"Fan %d RPM",p->fan_rpm);
+    else gui_text(ui,r[2].x+9,r[2].y+77,ui->dim,false,"Fan unavailable");
+
+    top+=tile_h+gap;
+    for(int i=0;i<3;i++) r[i].y=top;
+    panel_title(ui,r[0],"PCIe LINK");
+    if (p->pcie_link_valid) {
+        gui_text(ui,r[0].x+9,r[0].y+38,ui->fg,false,"NOW %s x%d",p->pcie_current_speed,p->pcie_current_width);
+        if (p->pcie_max_width>0 && p->pcie_max_speed[0])
+            gui_text(ui,r[0].x+9,r[0].y+58,ui->dim,false,"MAX %s x%d",p->pcie_max_speed,p->pcie_max_width);
+        gui_text(ui,r[0].x+9,r[0].y+80,p->pcie_link_loaded_low==1?ui->warn:ui->dim,false,
+                 "Under load: %s",p->pcie_link_loaded_low<0?"UNKNOWN":p->pcie_link_loaded_low?"LINK DOWN-SHIFT":"OK / IDLE");
+    } else gui_text(ui,r[0].x+9,r[0].y+44,ui->dim,false,"Link negotiation n/a");
+
+    panel_title(ui,r[1],"RESIZABLE / LARGE BAR");
+    if (p->bar0_valid) {
+        bool large=p->bar0_bytes>=1073741824ULL;
+        gui_text(ui,r[1].x+9,r[1].y+36,large?ui->good:ui->warn,false,
+                 "Large BAR: %s",large?"ENABLED":"DISABLED");
+        gui_text(ui,r[1].x+9,r[1].y+56,ui->fg,false,"BAR0 aperture %.1f GiB",p->bar0_bytes/1073741824.0);
+    } else {
+        gui_text(ui,r[1].x+9,r[1].y+38,ui->dim,false,"Large BAR: UNKNOWN");
+        gui_text(ui,r[1].x+9,r[1].y+58,ui->dim,false,"BAR0 aperture unavailable");
+    }
+    gui_text(ui,r[1].x+9,r[1].y+79,ui->dim,false,
+             "Resize sysfs: %s",p->rebar_supported?"EXPOSED":"NOT EXPOSED");
+
+    panel_title(ui,r[2],"PERFORMANCE FLAGS");
+    gui_text(ui,r[2].x+9,r[2].y+34,sys->cpu_boost<0?ui->dim:sys->cpu_boost?ui->good:ui->warn,
+             false,"CPU Boost: %s",sys->cpu_boost<0?"UNKNOWN":sys->cpu_boost?"ENABLED":"DISABLED");
+    gui_text(ui,r[2].x+9,r[2].y+53,ui->fg,false,"CPU governor: %s",
+             sys->cpu_governor[0]?sys->cpu_governor:"unknown");
+    gui_text(ui,r[2].x+9,r[2].y+72,p->amdgpu_dpm==0?ui->warn:ui->dim,false,"GPU DPM: %s",
+             p->amdgpu_dpm==-2?"UNKNOWN":p->amdgpu_dpm==-1?"AUTO":p->amdgpu_dpm?"ENABLED":"DISABLED");
+    gui_text(ui,r[2].x+9,r[2].y+89,ui->dim,false,"CPU SMT: %s",
+             sys->cpu_smt<0?"UNKNOWN":sys->cpu_smt?"ENABLED":"DISABLED");
 }
 
-/* AI MODE DASHBOARD (existing layout) */
+/* Unified, dense tile grid shared in size/spacing with the gaming dashboard. */
+static Rect ai_log_button_rect(const Gui *ui) {
+    int margin = UI_MARGIN, gap = UI_GAP;
+    int w = (ui->width - margin * 2 - gap) / 2;
+    return (Rect){margin + w + gap + w - 78, UI_PAGE_Y + 149, 70, 21};
+}
+
 static void draw_ai_dashboard(Gui *ui, const Gpu *g, const Target *t, const Stats *st, int interval_us,
                               bool adaptive, bool monitor_clocks, const ClientMonitor *cm,
                               const PowerTelemetry *p, const SessionInfo *si, const EventLog *el,
                               const TraceState *tr, const SystemTelemetry *sys) {
     (void)monitor_clocks;
-    int top = 377, gap = 10, margin = 12;
-    int w = (ui->width - margin * 2 - gap) / 2;
-    int h = 90;
-    Rect r[6] = {
-        {margin, top, w, h}, {margin + w + gap, top, w, h},
-        {margin, top + h + gap, w, h}, {margin + w + gap, top + h + gap, w, h},
-        {margin, top + 2*(h+gap), w, h}, {margin + w + gap, top + 2*(h+gap), w, h}
-    };
-    panel_title(ui, r[0], "LOCK / WATCHDOG");
-    gui_text(ui,r[0].x+10,r[0].y+45,ui->fg,false,"Target %s   %s",t->policy,t->enabled?"ENFORCING":"PAUSED");
-    gui_text(ui,r[0].x+10,r[0].y+68,ui->dim,false,"Base %.1f Hz  Adaptive %s  resets %llu",1000000.0/interval_us,adaptive?"on":"off",(unsigned long long)st->policy_mismatches);
+    (void)si;
+    (void)tr;
+    const int margin = UI_MARGIN, gap = UI_GAP, top = UI_PAGE_Y;
+    const int half = (ui->width - margin * 2 - gap) / 2;
+    const int lead_h = 180, tile_h = 96;
+    const int third = (ui->width - margin * 2 - gap * 2) / 3;
+    const int tile_top = top + lead_h + gap;
+    Rect perf = {margin, top, half, lead_h};
+    Rect log = {margin + half + gap, top, half, lead_h};
+    Rect r[6];
+    for (int i = 0; i < 6; i++)
+        r[i] = (Rect){margin + (i % 3) * (third + gap), tile_top + (i / 3) * (tile_h + gap), third, tile_h};
 
-    panel_title(ui, r[1], "AI PERFORMANCE");
-    if (sys->tokens.has_data) {
-        gui_text(ui,r[1].x+10,r[1].y+40,ui->accent,false,"~%.0f tok/s (%s)",sys->tokens.tokens_per_sec,sys->tokens.source_label);
-        /* Power efficiency */
-        if (p->power_w > 0.0) {
-            double tok_per_w = sys->tokens.tokens_per_sec / p->power_w;
-            gui_text(ui,r[1].x+10,r[1].y+58,ui->fg,false,"%.2f tok/s/W  %.1f W",tok_per_w,p->power_w);
-        }
-        /* Total tokens */
-        if (sys->tokens.total_tokens > 0) {
-            gui_text(ui,r[1].x+10,r[1].y+76,ui->dim,false,"Total: %lld tokens",(long long)sys->tokens.total_tokens);
-        }
+    panel_title(ui, perf, "AI PERFORMANCE");
+    if ((g_settings.log_parser==LOG_MAYA ||
+         (g_settings.log_parser==LOG_AUTO && !strcmp(sys->ai_log_source,"Project Maya"))) &&
+        (!sys->tokens.has_data || g_settings.token_source==TOKEN_SOURCE_MAYA) &&
+        (g_maya.prefill_valid || g_maya.decode_valid)) {
+        if(g_maya.decode_valid) gui_text(ui,perf.x+9,top+36,ui->accent,true,
+            "Maya decode %.1f tok/s (completed log)",g_maya.decode_tps);
+        else gui_text(ui,perf.x+9,top+36,ui->dim,true,"Maya decode: no completed stat");
+        if(g_maya.prefill_valid) gui_text(ui,perf.x+9,top+53,ui->fg,false,
+            "Prefill %.0f tok/s | %ld tokens",g_maya.prefill_tps,g_maya.prompt_tokens);
+        else gui_text(ui,perf.x+9,top+53,ui->dim,false,"Prefill: no measured timing in log");
+    } else if (sys->tokens.has_data && sys->tokens.tokens_per_sec > 0.0) {
+        gui_text(ui, perf.x+9, top+36, ui->accent, true, "%s: %.1f tok/s (%s)",
+                 sys->token_source == TOKEN_SOURCE_HEURISTIC ? "Est." : "Live",
+                 sys->tokens.tokens_per_sec, sys->tokens.source_label);
+        if (p->power_w > 0)
+            gui_text(ui, perf.x+9, top+53, ui->fg, false, "%.2f tok/s/W | %.1f W",
+                     sys->tokens.tokens_per_sec / p->power_w, p->power_w);
+    } else if (sys->ai_log_event_count > 0 && g_ai_log_events[0].has_eval) {
+        gui_text(ui,perf.x+9,top+36,ui->accent,true,"Last decode: %.1f tok/s (log)",g_ai_log_events[0].eval_tps);
+        gui_text(ui,perf.x+9,top+53,ui->dim,false,"Completed timing - not live throughput");
     } else {
-        gui_text(ui,r[1].x+10,r[1].y+45,ui->dim,false,"No AI workload detected");
-        gui_text(ui,r[1].x+10,r[1].y+68,ui->dim,false,"GPU %d%% busy  %.1f W",p->gpu_busy,p->power_w);
+        gui_text(ui,perf.x+9,top+36,ui->dim,false,"No live token rate available");
+        gui_text(ui,perf.x+9,top+53,ui->fg,false,"GPU %d%% | %.1f W",p->gpu_busy,p->power_w);
     }
+    /* Host RAM prompt-state cache; only the cache-state log provides usage.
+     * Never pass the full GPU VRAM reading as 'prompt cache used'. */
+    const AiPromptCache *cache = &sys->ai_prompt_cache;
+    bool maya_active=g_settings.log_parser==LOG_MAYA ||
+        (g_settings.log_parser==LOG_AUTO && !strcmp(sys->ai_log_source,"Project Maya"));
+    if (maya_active) {
+        if(g_maya.vram_hit_valid)
+            gui_text(ui,perf.x+9,top+82,ui->fg,false,"Maya VRAM expert hit %.1f%%",g_maya.vram_hit_pct);
+        else gui_text(ui,perf.x+9,top+82,ui->dim,false,"Maya VRAM hit: not reported");
+        if(g_maya.disk_valid)
+            gui_text(ui,perf.x+9,top+101,ui->fg,false,"Disk %.1f reads/tok | %.1f ms/tok",
+                     g_maya.disk_reads_per_token,g_maya.disk_wait_ms_per_token);
+        else gui_text(ui,perf.x+9,top+101,ui->dim,false,"Disk reads/tok: not reported");
+        if(g_maya.ram_fetch_valid)
+            gui_text(ui,perf.x+9,top+119,ui->dim,false,"RAM fetches %.1f/tok | engine statistics",
+                     g_maya.ram_fetches_per_token);
+        else gui_text(ui,perf.x+9,top+119,ui->dim,false,"Maya stats: available when logged");
+    } else if (cache->limit_valid && cache->limit_mib == 0) {
+        gui_text(ui,perf.x+9,top+82,ui->dim,false,"Host prompt cache: disabled");
+    } else if (cache->usage_valid && cache->limit_valid && cache->limit_mib > 0) {
+        char cache_label[120];
+        double pct = 100.0 * cache->used_mib / cache->limit_mib;
+        snprintf(cache_label,sizeof(cache_label),"Prompt RAM (log) %.2f/%.2f GiB (%.0f%%)",
+                 cache->used_mib/1024.0, cache->limit_mib/1024.0, pct);
+        gui_bar_color(ui,(Rect){perf.x+9,top+71,perf.w-18,19},pct,cache_label,
+                      pct >= 95 ? ui->bad : pct >= 85 ? ui->warn : ui->accent);
+    } else if (cache->usage_valid) {
+        gui_text(ui,perf.x+9,top+82,ui->fg,false,"Prompt RAM %.2f GiB | limit %s",
+                 cache->used_mib/1024.0,cache->limit_valid?"unlimited":"unknown");
+    } else if (cache->limit_valid && cache->limit_mib > 0) {
+        gui_text(ui,perf.x+9,top+82,ui->dim,false,"Prompt RAM usage: -- / %.2f GiB",
+                 cache->limit_mib/1024.0);
+    } else {
+        gui_text(ui,perf.x+9,top+82,ui->dim,false,"Prompt RAM cache: usage unavailable");
+    }
+    if (maya_active) {
+        /* Project Maya has its own expert tiers; llama.cpp host prompt-cache
+           counters are not meaningful and must not be shown here. */
+    } else if (cache->usage_valid || cache->save_attempts || cache->matches ||
+        cache->evictions || cache->rejected || cache->load_failures || cache->forced_reprocess) {
+        if (cache->usage_valid)
+            gui_text(ui,perf.x+9,top+101,ui->fg,false,"States %d | matches %d | evicts %d (%.1f GiB)",
+                     cache->entries,cache->matches,cache->evictions,cache->evicted_mib/1024.0);
+        else
+            gui_text(ui,perf.x+9,top+101,ui->fg,false,"States -- | matches %d | evicts %d (%.1f GiB)",
+                     cache->matches,cache->evictions,cache->evicted_mib/1024.0);
+        gui_text(ui,perf.x+9,top+119,ui->dim,false,"Save tries %d | skip %d | fail %d | redo %d",
+                 cache->save_attempts,cache->rejected,cache->load_failures,cache->forced_reprocess);
+    } else {
+        gui_text(ui,perf.x+9,top+101,ui->dim,false,"Cache events: unavailable from current log");
+        gui_text(ui,perf.x+9,top+119,ui->dim,false,"Enable Bionic cache-state logging for stats");
+    }
+    const char *activity = sys->ai_model_activity[0] ? sys->ai_model_activity : "Idle";
+    unsigned long activity_color = strcmp(activity,"Idle") == 0 ? ui->dim : ui->good;
+    gui_text(ui,perf.x+9,top+139,activity_color,true,"Activity: %s",activity);
+    if (sys->tokens.is_processing) {
+        gui_text(ui,perf.x+9,top+158,ui->fg,false,"Prompt processed %lld / %lld tokens",
+                 (long long)sys->tokens.n_prompt_tokens_processed,(long long)sys->tokens.n_prompt_tokens);
+    } else if (sys->ai_log_event_count) {
+        const AiLogEvent *ev = &g_ai_log_events[0];
+        gui_text(ui,perf.x+9,top+158,ui->dim,false,"Task #%d | %s | P %.0f / D %.0f tok",
+                 ev->task_id,ev->time_str,ev->prompt_tokens,ev->eval_tokens);
+    } else {
+        gui_text(ui,perf.x+9,top+158,ui->dim,false,"Counters: recent log tail, not lifetime");
+    }
+
+    panel_title(ui, log, "AI PERFORMANCE LOG");
+    bool maya_log = g_settings.log_parser==LOG_MAYA ||
+                    (g_settings.log_parser==LOG_AUTO && !strcmp(sys->ai_log_source,"Project Maya"));
+    if(maya_log && g_maya.count) {
+        for(int i=0;i<g_maya.count;i++) {
+            gui_text(ui,log.x+9,top+36+i*42,ui->dim,false,"%.56s",g_maya.recent[i]);
+        }
+    } else if (sys->ai_log_event_count) {
+        int n = sys->ai_log_event_count < 3 ? sys->ai_log_event_count : 3;
+        for (int i=0; i<n; ++i) {
+            const AiLogEvent *ev=&g_ai_log_events[i];
+            int y=top+34+i*37;
+            gui_text(ui,log.x+9,y,i==0?ui->fg:ui->dim,false,
+                     "%s  task %d / slot %d  %s",ev->time_str,ev->task_id,ev->slot_id,
+                     ev->has_total?"done":ev->has_eval?"decode":"prompt");
+            gui_text(ui,log.x+9,y+16,ui->dim,false,
+                     "Prompt %.0f @ %.1f/s | Decode %.0f @ %.1f/s",
+                     ev->prompt_tokens,ev->prompt_tps,ev->eval_tokens,ev->eval_tps);
+        }
+    } else gui_text(ui,log.x+9,top+37,ui->dim,false,
+                    maya_log?"No Maya engine lines in log tail":"No recent timing entries in log");
+    if (sys->ai_log_path[0]) draw_button(ui, ai_log_button_rect(ui), "View Log", false);
+
+    panel_title(ui, r[0], "LOCK / WATCHDOG");
+    gui_text(ui,r[0].x+9,r[0].y+36,ui->fg,false,"%s",t->enabled?"ENFORCING":"PAUSED");
+    gui_text(ui,r[0].x+9,r[0].y+54,ui->dim,false,"Target %s",t->policy);
+    gui_text(ui,r[0].x+9,r[0].y+72,ui->dim,false,"%.0f Hz | adaptive %s | resets %llu",
+             1000000.0/interval_us,adaptive?"on":"off",(unsigned long long)st->policy_mismatches);
+
+    panel_title(ui, r[1], "MODEL INFO");
+    if (maya_active) {
+        gui_text(ui,r[1].x+9,r[1].y+35,ui->fg,false,"Project Maya engine log");
+        gui_text(ui,r[1].x+9,r[1].y+52,ui->dim,false,"Engine stats: %lu entries in tail",g_maya.recognized);
+        const char *base=strrchr(sys->ai_log_path,'/');
+        gui_text(ui,r[1].x+9,r[1].y+71,ui->dim,false,"%.25s",base?base+1:
+                 sys->ai_log_path[0]?sys->ai_log_path:"No log discovered");
+    } else if (sys->ai_model_info_valid) {
+        gui_text(ui,r[1].x+9,r[1].y+35,ui->fg,false,"Context %d",sys->ai_ctx_size);
+        gui_text(ui,r[1].x+9,r[1].y+52,ui->fg,false,"KV %s / %s",sys->ai_cache_type_k,sys->ai_cache_type_v);
+        gui_text(ui,r[1].x+9,r[1].y+69,ui->dim,false,"Flash %s | MTP %s",sys->ai_flash_attn?"on":"off",sys->ai_mtp?"on":"off");
+    } else gui_text(ui,r[1].x+9,r[1].y+42,ui->dim,false,"No model data");
 
     panel_title(ui, r[2], "GPU CLIENTS / VRAM");
     const GpuClient *c = top_client(cm);
     if (c) {
-        gui_text(ui,r[2].x+10,r[2].y+40,ui->fg,false,"Top: %s",c->role[0]?c->role:c->name);
-        gui_text(ui,r[2].x+10,r[2].y+58,ui->dim,false,"%.2f%% activity  PID %d",c->activity_pct,c->pid);
-    } else {
-        gui_text(ui,r[2].x+10,r[2].y+40,ui->dim,false,"No DRM client activity yet");
-    }
-    /* VRAM usage */
-    if (g->vram_bytes > 0) {
-        double vram_pct = (double)p->vram_used * 100.0 / (double)g->vram_bytes;
-        gui_text(ui,r[2].x+10,r[2].y+76,ui->fg,false,"VRAM: %.2f/%.2f GiB (%.1f%%)",
-                 p->vram_used/1073741824.0, g->vram_bytes/1073741824.0, vram_pct);
-    }
+        gui_text(ui,r[2].x+9,r[2].y+36,ui->fg,false,"%s",c->role[0]?c->role:c->name);
+        gui_text(ui,r[2].x+9,r[2].y+54,ui->dim,false,"PID %d | activity %.1f%%",c->pid,c->activity_pct);
+    } else gui_text(ui,r[2].x+9,r[2].y+36,ui->dim,false,"No active DRM clients");
+    if (g->vram_bytes)
+        gui_text(ui,r[2].x+9,r[2].y+74,ui->fg,false,"VRAM %.1f / %.1f GiB",p->vram_used/1073741824.0,g->vram_bytes/1073741824.0);
 
-    panel_title(ui, r[3], "X11 / DESKTOP");
-    gui_text(ui,r[3].x+10,r[3].y+45,ui->fg,false,"%s / %s",si->session_type,si->desktop);
-    gui_text(ui,r[3].x+10,r[3].y+68,ui->dim,false,"WM %s   compositor %s",si->window_manager,si->compositor);
+    panel_title(ui, r[3], "TOP CPU PROCESSES / 2s");
+    if (sys->top_proc_count > 0) {
+        for (int i=0; i<sys->top_proc_count && i<3; ++i)
+            gui_text(ui,r[3].x+9,r[3].y+35+i*18,ui->fg,false,"#%d %5.1f%% %.17s",
+                     i+1,sys->top_procs[i].cpu_pct,sys->top_procs[i].name);
+    } else gui_text(ui,r[3].x+9,r[3].y+40,ui->dim,false,"No CPU activity in sample yet");
 
     panel_title(ui, r[4], "LAST EVENT");
     const DiagEvent *ev = event_last(el);
     if (ev) {
-        gui_text(ui,r[4].x+10,r[4].y+45,ui->fg,false,"%.20s: %.50s",ev->kind,ev->detail);
-        gui_text(ui,r[4].x+10,r[4].y+68,ui->dim,false,"Actor %s (%.2f%%)",ev->actor,ev->actor_activity);
-    } else gui_text(ui,r[4].x+10,r[4].y+48,ui->dim,false,"No diagnostic events yet");
+        gui_text(ui,r[4].x+9,r[4].y+36,ui->fg,false,"%s",ev->kind);
+        gui_text(ui,r[4].x+9,r[4].y+54,ui->fg,false,"%s",ev->detail);
+        gui_text(ui,r[4].x+9,r[4].y+73,ui->dim,false,"Actor %s (%.1f%%)",ev->actor,ev->actor_activity);
+    } else gui_text(ui,r[4].x+9,r[4].y+40,ui->dim,false,"No diagnostic events");
 
-    panel_title(ui, r[5], "TRACE / LOG");
-    gui_text(ui,r[5].x+10,r[5].y+45,ui->fg,false,"Kernel trace %s   lines %llu",tr->active?"ON":"off",(unsigned long long)tr->lines);
-    gui_text(ui,r[5].x+10,r[5].y+68,ui->dim,false,"CSV log %s   events %llu",el->logging?"ON":"off",(unsigned long long)el->total);
-
-    /* Top CPU processes */
-    int ty = top + 3*(h+gap);
-    panel_title(ui, (Rect){margin, ty, ui->width - margin*2, 70}, "TOP CPU PROCESSES");
-    for (int i = 0; i < sys->top_proc_count; i++) {
-        gui_text(ui, margin + 10 + i * 300, ty + 45, ui->fg, false,
-                 "#%d PID %d %s", i+1, sys->top_procs[i].pid, sys->top_procs[i].name);
-    }
+    panel_title(ui,r[5],"AI NVME CACHE I/O");
+    gui_text(ui,r[5].x+9,r[5].y+35,ui->fg,false,"Drive: %s",g_nvme.selected[0]?g_nvme.selected:"None selected");
+    if(g_nvme.valid) {
+        gui_text(ui,r[5].x+9,r[5].y+53,ui->accent,false,"Read %.1f | Write %.1f MiB/s",g_nvme.read_mib_s,g_nvme.write_mib_s);
+        gui_text(ui,r[5].x+9,r[5].y+72,ui->dim,false,"Peak R %.0f W %.0f | Busy %.0f%%",
+                 g_nvme.peak_read_mib_s,g_nvme.peak_write_mib_s,g_nvme.busy_pct);
+    } else gui_text(ui,r[5].x+9,r[5].y+57,ui->dim,false,"Waiting for selected NVMe counters");
+    gui_text(ui,r[5].x+9,r[5].y+89,ui->dim,false,"Whole drive traffic, not AI-only");
 }
 
 /* Main dashboard dispatcher */
@@ -3846,92 +5366,65 @@ static void draw_dashboard(Gui *ui, const Gpu *g, const Sysfs *s, const Target *
                            const PowerTelemetry *p, const SessionInfo *si, const EventLog *el,
                            const TraceState *tr, const SystemTelemetry *sys) {
     if (g_workflow == WORKFLOW_GAMING) {
-        draw_gaming_dashboard(ui, g, s, p, sys, &sys->frametimes);
+        draw_gaming_dashboard(ui, g, s, p, sys);
     } else {
         draw_ai_dashboard(ui, g, t, st, interval_us, adaptive, monitor_clocks, cm, p, si, el, tr, sys);
     }
 }
 
 static void draw_clients_page(Gui *ui, const ClientMonitor *cm) {
-    int y = 385;
-    gui_text(ui,16,y,ui->accent,true,"Per-process DRM activity"); y += 25;
-    gui_text(ui,16,y,ui->dim,false,"PID      PROCESS / ROLE                          TOTAL    GFX   COMP    DMA  MEDIA      VRAM"); y += 20;
+    int y = UI_PAGE_Y+16;
+    gui_text(ui,16,y,ui->accent,true,"Per-process DRM activity"); y += 23;
+    gui_text(ui,16,y,ui->dim,false,"PID    PROCESS / ROLE                  TOTAL   GFX  COMP   DMA MEDIA   VRAM"); y += 18;
     int max = cm->count < 14 ? cm->count : 14;
     for (int i=0;i<max;i++) {
         const GpuClient *c=&cm->items[i];
-        gui_text(ui,16,y,ui->fg,false,"%-8d %-39.39s %7.2f %6.2f %6.2f %6.2f %6.2f %7.1fM",
+        gui_text(ui,16,y,ui->fg,false,"%-6d %-29.29s %6.1f %5.1f %5.1f %5.1f %5.1f %6.0fM",
                  c->pid,c->role[0]?c->role:c->name,c->activity_pct,c->gfx_pct,c->compute_pct,c->dma_pct,c->media_pct,c->vram_bytes/1048576.0);
-        y += 22;
+        y += 18;
     }
-    gui_text(ui,16,ui->height-92,ui->dim,false,"Scan CPU %.3f%%  scans %llu  fdinfo reads %llu  errors %llu",
+    gui_text(ui,16,y+18,ui->dim,false,"Scan CPU %.3f%%  scans %llu  fdinfo reads %llu  errors %llu",
              cm->scan_cpu_pct,(unsigned long long)cm->scans,(unsigned long long)cm->fdinfo_reads,(unsigned long long)cm->scan_errors);
 }
 
 static void draw_power_page(Gui *ui, const Target *t, const Stats *st, const PowerTelemetry *p,
                             const Sysfs *s, const SystemTelemetry *sys,
                             bool monitor_clocks, int dpm_interval_us) {
-    int x=18,y=385;
-    gui_text(ui,x,y,ui->accent,true,"Power, thermal, and DPM telemetry"); y+=30;
-    gui_text(ui,x,y,ui->fg,false,"Policy target: %s    watchdog: %s",t->policy,t->enabled?"enforcing":"paused"); y+=24;
-    gui_text(ui,x,y,ui->fg,false,"GPU busy %d%%   MEM busy %d%%   board power %.2f W",p->gpu_busy,p->mem_busy,p->power_w); y+=24;
-    gui_text(ui,x,y,ui->fg,false,"Power cap %.1f W   firmware range %.1f - %.1f W",
-             p->power_cap_w,p->power_cap_min_w,p->power_cap_max_w); y+=24;
-    if (sys->tokens.has_data) {
-        gui_text(ui,x,y,ui->accent,false,"Token rate: ~%.0f tok/s (%s)",sys->tokens.tokens_per_sec,sys->tokens.source_label); y+=24;
+    (void)st; (void)monitor_clocks; (void)dpm_interval_us;
+    int x=UI_MARGIN,y=UI_PAGE_Y+16;
+    gui_text(ui,x,y,ui->accent,true,"ELECTRICAL / POWER telemetry (read-only)"); y+=30;
+    gui_text(ui,x,y,ui->fg,false,"GPU board power: %s",p->power_w>=0?"available":"not reported"); y+=21;
+    if(p->power_w>=0) {gui_text(ui,x,y,ui->fg,true,"Measured board power  %.2f W",p->power_w); y+=22;}
+    if(sys->cpu_power_w>=0) {gui_text(ui,x,y,ui->fg,false,"CPU package power    %.2f W (hwmon)",sys->cpu_power_w); y+=22;}
+    else {gui_text(ui,x,y,ui->dim,false,"CPU package power    unavailable"); y+=22;}
+    gui_text(ui,x,y,ui->fg,false,"GPU power cap         %.1f W",p->power_cap_w); y+=22;
+    gui_text(ui,x,y,ui->dim,false,"Firmware cap range     %.1f - %.1f W",p->power_cap_min_w,p->power_cap_max_w); y+=30;
+    gui_text(ui,x,y,ui->accent,true,"Voltage / current"); y+=26;
+    if(p->voltage_v>=0) gui_text(ui,x,y,ui->fg,false,"%s: %.4f V",s->voltage_label[0]?s->voltage_label:"GPU voltage",p->voltage_v);
+    else {gui_text(ui,x,y,ui->dim,false,"GPU voltage: not exposed");} y+=22;
+    if(p->current_a>=0) gui_text(ui,x,y,ui->fg,false,"%s current: %.2f A%s",p->current_label,p->current_a,
+                                p->current_is_estimate?" (derived estimate)":" (sensor)");
+    else {gui_text(ui,x,y,ui->dim,false,"GPU current: unavailable");} y+=22;
+    if(p->equivalent_input_ohm>=0) {
+        gui_text(ui,x,y,ui->dim,false,"Equivalent 12 V load: %.3f ohm (estimated)",p->equivalent_input_ohm); y+=22;
     }
-
-    for (int i=0;i<MAX_GPU_TEMPS;i++) {
-        if (p->temps_c[i] < 0.0) continue;
-        double crit=s->temp_crit_mc[i]>0?s->temp_crit_mc[i]/1000.0:-1.0;
-        double emerg=s->temp_emergency_mc[i]>0?s->temp_emergency_mc[i]/1000.0:-1.0;
-        gui_text(ui,x,y,tune_zone_color(ui,temperature_zone(p->temps_c[i],s->temp_crit_mc[i],s->temp_emergency_mc[i])),true,
-                 "%s %.1f C   crit %.1f C   emergency %.1f C",
-                 s->temp_label[i][0]?s->temp_label[i]:"GPU",p->temps_c[i],crit,emerg); y+=23;
-    }
-    if (sys->cpu_temp_c >= 0.0) {
-        double crit=sys->cpu_temp_crit_mc>0?sys->cpu_temp_crit_mc/1000.0:-1.0;
-        gui_text(ui,x,y,tune_zone_color(ui,temperature_zone(sys->cpu_temp_c,sys->cpu_temp_crit_mc,-1)),true,
-                 "CPU %s %.1f C   crit %.1f C",sys->cpu_temp_label,sys->cpu_temp_c,crit); y+=23;
-    }
-
-    /* CPU fan */
-    if (sys->cpu_fan_rpm > 0 || sys->cpu_fan_pct > 0.0) {
-        gui_text(ui,x,y,ui->fg,true,"CPU Fan %d RPM / %.1f%%",sys->cpu_fan_rpm,sys->cpu_fan_pct); y+=23;
-    }
-
-    /* Motherboard temps */
-    for (int i=0;i<sys->mb_temp_count;i++) {
-        if (sys->mb_temp_c[i] >= 0.0) {
-            gui_text(ui,x,y,ui->fg,false,"MB %s %.1f C",sys->mb_temp_labels[i],sys->mb_temp_c[i]); y+=23;
-        }
-    }
-
-    gui_text(ui,x,y,ui->fg,false,"Fan %d RPM / %.1f%%   voltage %.3f V",p->fan_rpm,p->fan_pct,p->voltage_v); y+=24;
-    gui_text(ui,x,y,ui->fg,false,"Current %.2f A%s (%s)   12V equivalent load %.3f ohm",
-             p->current_a,p->current_is_estimate?" estimated":"",p->current_label,p->equivalent_input_ohm); y+=24;
-    gui_text(ui,x,y,ui->fg,false,"GFX %.0f MHz (%s)   MEM %.0f MHz (%s)",p->gfx_hz/1000000.0,p->freq1_label,p->mem_hz/1000000.0,p->freq2_label); y+=24;
-    gui_text(ui,x,y,ui->fg,false,"GFXOFF %s   transitions %llu   enabled %d",gfxoff_text(p->gfxoff_status),(unsigned long long)p->gfxoff_status_changes,p->gfxoff_enabled); y+=24;
-    gui_text(ui,x,y,ui->dim,false,"Power profile: %.140s",p->power_profile); y+=24;
-    gui_text(ui,x,y,ui->dim,false,"PCIe: %.150s",p->pcie_bw); y+=28;
-    gui_text(ui,x,y,ui->accent,true,"Watchdog / DPM counters"); y+=26;
-    gui_text(ui,x,y,ui->fg,false,"checks %llu  corrections %llu  policy mismatches %llu  verify failures %llu",
-             (unsigned long long)st->checks,(unsigned long long)st->corrections,(unsigned long long)st->policy_mismatches,(unsigned long long)st->verify_failures); y+=24;
-    gui_text(ui,x,y,ui->fg,false,"SCLK changes %llu  MCLK changes %llu  DPM sampling %s @ %.1f Hz",
-             (unsigned long long)st->observed_sclk_changes,(unsigned long long)st->observed_mclk_changes,
-             monitor_clocks?"ON":"off",1000000.0/dpm_interval_us); y+=24;
-    gui_text(ui,x,y,ui->dim,false,"SCLK: %.150s",st->sclk_display[0]?st->sclk_display:"not sampled"); y+=22;
-    gui_text(ui,x,y,ui->dim,false,"MCLK: %.150s",st->mclk_display[0]?st->mclk_display:"not sampled");
+    gui_text(ui,x,y,ui->accent,true,"Electrical control state"); y+=26;
+    gui_text(ui,x,y,ui->fg,false,"Power profile: %.160s",p->power_profile[0]?p->power_profile:"unavailable"); y+=22;
+    gui_text(ui,x,y,ui->fg,false,"Power policy: %s   watchdog: %s",t->policy,t->enabled?"enforcing":"paused"); y+=23;
+    gui_text(ui,x,y,ui->dim,false,"Thermals, clocks, link and AI metrics have their own dedicated pages.");
 }
 
 static void draw_tuning_row(Gui *ui, int row, const char *name, const char *value,
                             const char *range, TuneZone zone, bool available) {
-    int y = 500 + row * 68;
-    Rect panel = {18, y, ui->width - 36, 54};
+    Rect panel = tuning_tile_rect(ui, row);
+    int y = panel.y;
     gui_fill(ui, panel, ui->panel);
     gui_outline(ui, panel, available ? tune_zone_color(ui, zone) : ui->dim);
-    gui_text(ui, 30, y + 22, available ? ui->fg : ui->dim, true, "%s", name);
-    gui_text(ui, 230, y + 22, available ? tune_zone_color(ui, zone) : ui->dim, true, "%s", value);
-    gui_text(ui, 420, y + 22, ui->dim, false, "%s", range);
+    gui_text(ui, panel.x+9, y + 18, available ? ui->fg : ui->dim, true, "%s", name);
+    gui_text(ui, panel.x+9, y + 40, available ? tune_zone_color(ui, zone) : ui->dim, true, "%s", value);
+    ui->text_right = panel.x + panel.w - 9;
+    gui_text(ui, panel.x+9, y + 62, ui->dim, false, "%s", range);
+    ui->text_right = 0;
     if (available) {
         draw_button(ui, tuning_minus_rect(ui,row), "-", false);
         draw_button(ui, tuning_plus_rect(ui,row), "+", false);
@@ -3939,13 +5432,13 @@ static void draw_tuning_row(Gui *ui, int row, const char *name, const char *valu
         Rect mr=tuning_minus_rect(ui,row), pr=tuning_plus_rect(ui,row);
         gui_fill(ui,mr,ui->panel_alt); gui_outline(ui,mr,ui->dim);
         gui_fill(ui,pr,ui->panel_alt); gui_outline(ui,pr,ui->dim);
-        gui_text(ui,mr.x+28,mr.y+21,ui->dim,true,"-");
-        gui_text(ui,pr.x+28,pr.y+21,ui->dim,true,"+");
+        gui_text(ui,mr.x+11,mr.y+17,ui->dim,true,"-");
+        gui_text(ui,pr.x+11,pr.y+17,ui->dim,true,"+");
     }
 }
 
 static void draw_tuning_page(Gui *ui, const TuningState *t) {
-    int x=18,y=385;
+    int x=UI_MARGIN,y=UI_PAGE_Y+16;
     gui_text(ui,x,y,ui->accent,true,"Software tuning - firmware bounded"); y+=28;
     gui_text(ui,x,y,ui->warn,true,
              "Green/amber/red = aggressiveness relative to captured stock, NOT a hardware-safety guarantee."); y+=26;
@@ -3959,7 +5452,7 @@ static void draw_tuning_page(Gui *ui, const TuningState *t) {
     } else {
         gui_text(ui,x,y,ui->dim,false,"No exact reference-card match; driver/firmware ranges remain fully authoritative."); y+=23;
     }
-    gui_text(ui,x,y,ui->dim,false,"Built-in reference database: %zu desktop Radeon models.",gpu_spec_count());
+    gui_text(ui,x,UI_PAGE_Y+99,ui->dim,false,"Built-in reference database: %zu desktop Radeon models.",gpu_spec_count());
 
     char value[96], range[160];
     TuneZone z;
@@ -4023,47 +5516,67 @@ static void draw_tuning_page(Gui *ui, const TuningState *t) {
     }
 
     char arm[64];
-    snprintf(arm,sizeof(arm),"ARM WRITES: %s",t->armed?"ARMED":"disarmed");
+    snprintf(arm,sizeof(arm),"ARM: %s",t->armed?"ON":"OFF");
+    Rect safe=tuning_tile_rect(ui,5);
+    panel_title(ui,safe,"SAFETY / WORKFLOW");
     draw_button(ui,tuning_action_rect(ui,0),arm,t->armed);
     draw_button(ui,tuning_action_rect(ui,1),"APPLY",false);
     draw_button(ui,tuning_action_rect(ui,2),"RESET STOCK",false);
     draw_button(ui,tuning_action_rect(ui,3),"REFRESH",false);
-
-    gui_text(ui,20,865,ui->dim,false,
-             "Clock/voltage writes use pp_od_clk_voltage; power cap uses hwmon. Unsupported/legacy formats stay read-only.");
+    gui_text(ui,UI_MARGIN,747,ui->warn,false,
+             "ARM then APPLY required. RESET STOCK changes device settings; firmware limits apply.");
+    gui_text(ui,UI_MARGIN,769,ui->dim,false,
+             "Clock/voltage: pp_od_clk_voltage; power cap: hwmon. Unsupported settings are read-only.");
 }
 
 static void draw_desktop_page(Gui *ui, const SessionInfo *si) {
-    int x=18,y=385;
-    gui_text(ui,x,y,ui->accent,true,"X11 / XLibre rendering stack"); y+=30;
-    gui_text(ui,x,y,ui->fg,false,"Session: %s   Display: %s",si->session_type,si->display); y+=24;
-    gui_text(ui,x,y,ui->fg,false,"X server vendor: %.100s",si->xserver_vendor[0]?si->xserver_vendor:"unknown"); y+=24;
-    gui_text(ui,x,y,ui->fg,false,"Desktop: %s   Window manager: %s",si->desktop,si->window_manager); y+=24;
-    gui_text(ui,x,y,ui->fg,false,"Compositor: %s   PID %d",si->compositor,si->compositor_pid); y+=32;
-    gui_text(ui,x,y,ui->accent,true,"Display / KMS"); y+=28;
-    gui_text(ui,x,y,ui->fg,false,"Connected outputs: %d   %s",si->connected_outputs,si->connector_summary); y+=24;
-    gui_text(ui,x,y,ui->fg,false,"Current modes: %.150s",si->kms_modes); y+=24;
-    gui_text(ui,x,y,ui->fg,false,"Active planes: %d   allocators: %.120s",si->active_planes,si->plane_allocators); y+=30;
-    gui_text(ui,x,y,ui->dim,false,"Compositor detection uses the X11 _NET_WM_CM_S0 selection owner first, then process heuristics.");
+    int x=UI_MARGIN,y=UI_PAGE_Y+16;
+    gui_text(ui,x,y,ui->accent,true,"Desktop / X server software & display state"); y+=28;
+    gui_text(ui,x,y,ui->fg,false,"Session: %s  |  X display: %s",si->session_type,si->display); y+=24;
+    gui_text(ui,x,y,ui->fg,false,"Session manager: %s   built %s",si->session_version[0]?si->session_version:"unknown",
+             si->session_built[0]?si->session_built:"unknown");y+=24;
+    gui_text(ui,x,y,ui->fg,false,"X server: %s   built %s",si->xserver_version,si->xserver_built[0]?si->xserver_built:"unknown");y+=24;
+    gui_text(ui,x,y,ui->dim,false,"X vendor: %.110s",si->xserver_vendor);y+=24;
+    gui_text(ui,x,y,ui->fg,false,"Desktop %s: %s   built %s",si->desktop,
+             si->desktop_version[0]?si->desktop_version:"unknown",si->desktop_built[0]?si->desktop_built:"unknown");y+=24;
+    gui_text(ui,x,y,ui->fg,false,"WM %s: %s   built %s",si->window_manager,
+             si->wm_version[0]?si->wm_version:"unknown",si->wm_built[0]?si->wm_built:"unknown");y+=24;
+    gui_text(ui,x,y,ui->fg,false,"Compositor %s: %s   built %s",si->compositor,
+             si->compositor_version[0]?si->compositor_version:"unknown",si->compositor_built[0]?si->compositor_built:"unknown");y+=22;
+    gui_text(ui,x,y,ui->dim,false,"Compositor PID %d  |  detector: %s",si->compositor_pid,
+             g_compositor_names[g_settings.compositor_source]); y+=34;
+    gui_text(ui,x,y,ui->accent,true,"Display timing / presentation"); y+=27;
+    gui_text(ui,x,y,ui->fg,false,"Refresh rate: %s",si->refresh);y+=22;
+    gui_text(ui,x,y,ui->fg,false,"Active modes: %.155s",si->kms_modes);y+=22;
+    gui_text(ui,x,y,ui->fg,false,"VRR / FreeSync / G-Sync: %s",si->vrr_state);y+=22;
+    gui_text(ui,x,y,ui->dim,false,"VSync: %s",si->vsync_state);y+=22;
+    gui_text(ui,x,y,ui->dim,false,"Buffering: %s",si->buffer_state);y+=28;
+    gui_text(ui,x,y,ui->accent,true,"Outputs / KMS");y+=25;
+    gui_text(ui,x,y,ui->fg,false,"%d connected: %.155s",si->connected_outputs,si->connector_summary);y+=22;
+    gui_text(ui,x,y,ui->fg,false,"Active planes %d; allocators: %.150s",si->active_planes,si->plane_allocators);y+=28;
+    gui_text(ui,x,y,ui->dim,false,"Version/build dates are from installed Arch packages (when available).");y+=21;
+    gui_text(ui,x,y,ui->dim,false,"Refresh/VRR reflect DRM reports, not per-game presentation guarantees.");
 }
 
 static void draw_events_page(Gui *ui, const EventLog *el) {
-    int y=385;
-    gui_text(ui,16,y,ui->accent,true,"Diagnostic flight recorder - newest first"); y+=26;
-    int max=el->count<15?el->count:15;
-    for(int n=0;n<max;n++) {
+    int y=UI_PAGE_Y+16;
+    gui_text(ui,16,y,ui->accent,true,"Diagnostic flight recorder - newest first"); y+=24;
+    int printed=0;
+    for(int n=0;n<el->count && printed<15;n++) {
         int idx=el->head-1-n; while(idx<0) idx+=MAX_DIAG_EVENTS;
         const DiagEvent *ev=&el->ring[idx];
-        gui_text(ui,16,y,ui->fg,false,"%3d  %-13s %-48.48s  actor %-24.24s %6.2f%%",
-                 n+1,ev->kind,ev->detail,ev->actor,ev->actor_activity);
-        y+=22;
+        /* High-frequency samples do not displace the meaningful fault/control history. */
+        if(!strcmp(ev->kind,"DPM CHANGE") || !strcmp(ev->kind,"GFXOFF")) continue;
+        gui_text(ui,16,y,ui->fg,false,"%2d  %-12.12s %-42.42s actor %-14.14s %5.1f%%",
+                 ++printed,ev->kind,ev->detail,ev->actor,ev->actor_activity);
+        y+=18;
     }
-    gui_text(ui,16,ui->height-92,ui->dim,false,"Total %llu   CSV logging %s%s%s",
+    gui_text(ui,16,y+20,ui->dim,false,"Last 15 major events | Total %llu   CSV logging %s%s%s",
              (unsigned long long)el->total,el->logging?"ON":"off",el->logging?"  ":"",el->logging?el->log_path:"");
 }
 
 static void draw_trace_page(Gui *ui, const TraceState *tr) {
-    int x=18,y=385;
+    int x=UI_MARGIN,y=UI_PAGE_Y+16;
     gui_text(ui,x,y,ui->accent,true,"Kernel tracefs diagnostics"); y+=30;
     gui_text(ui,x,y,ui->fg,false,"Available: %s   Active: %s   total lines %llu",tr->available?"yes":"no",tr->active?"YES":"no",(unsigned long long)tr->lines); y+=24;
     gui_text(ui,x,y,ui->fg,false,"AMDGPU events %d   scheduler events %d   DRM events %d",tr->amdgpu_events,tr->drm_sched_events,tr->drm_events); y+=24;
@@ -4074,61 +5587,94 @@ static void draw_trace_page(Gui *ui, const TraceState *tr) {
     gui_text(ui,x,y,ui->warn,true,"T toggles tracing. It is OFF by default because tracing is diagnostic, not normal monitoring.");
 }
 
+static Rect settings_option_rect(const Gui *ui,int row) {
+    return (Rect){ui->width-UI_MARGIN-272,UI_PAGE_Y+41+row*59,272,24};
+}
+static Rect settings_path_rect(const Gui *ui) {return settings_option_rect(ui,3);}
+static Rect settings_gpu_switch_rect(const Gui *ui) {
+    (void)ui;
+    return (Rect){UI_MARGIN,UI_PAGE_Y+41+8*59,112,24};
+}
+static Rect settings_unlock_rect(const Gui *ui) {return settings_option_rect(ui,7);}
+static void draw_settings_page(Gui *ui,const Gpu *g,const Gpu *gpus,int ngpu) {
+    int x=UI_MARGIN;
+    static const char *const sources[]={"Power heuristic","llama.cpp API","Ollama API","vLLM API","LM Studio API","Project Maya (log)"};
+    gui_text(ui,x,UI_PAGE_Y+16,ui->accent,true,"SETTINGS / CONFIGURATION");
+    for(int i=0;i<8;i++) {
+        Rect r=settings_option_rect(ui,i);
+        const char *label=i==0?"AI DATA SOURCE":i==1?"AI LOG PARSER":i==2?"AI LOG DISCOVERY":
+                          i==3?"AI LOG FILENAME":i==4?"AI NVME CACHE SSD":i==5?"COMPOSITOR SOURCE":
+                          i==6?"AMD GPU SELECTOR":"OVERCLOCK UNLOCK";
+        gui_text(ui,x,r.y+17,ui->fg,true,"%s",label);
+    }
+    draw_button(ui,settings_option_rect(ui,0),sources[g_settings.token_source],false);
+    draw_button(ui,settings_option_rect(ui,1),g_parser_names[g_settings.log_parser],false);
+    draw_button(ui,settings_option_rect(ui,2),g_settings.ai_log_manual?"Manual file":"Auto detect newest",false);
+    draw_button(ui,settings_path_rect(ui),g_edit_ai_path?"Editing (Enter to save)":"EDIT FILENAME",g_edit_ai_path);
+    ui->text_right=ui->width-UI_MARGIN;
+    gui_text(ui,x,settings_option_rect(ui,3).y+43,ui->dim,false,"Path: %.190s",
+             g_edit_ai_path?g_edit_path_buffer:g_settings.ai_log_file[0]?g_settings.ai_log_file:"(not configured)");
+    ui->text_right=0;
+    char nv_label[190];
+    snprintf(nv_label,sizeof(nv_label),"%s",g_nvme.selected[0]?g_nvme.selected:"No NVMe found");
+    for(int i=0;i<g_nvme.device_count;i++) if(!strcmp(g_nvme.selected,g_nvme.devices[i].name)) {
+        snprintf(nv_label,sizeof(nv_label),"%s | %.65s",g_nvme.selected,g_nvme.devices[i].model);
+        break;
+    }
+    draw_button(ui,settings_option_rect(ui,4),nv_label,false);
+    draw_button(ui,settings_option_rect(ui,5),g_compositor_names[g_settings.compositor_source],false);
+    int desired=g_requested_gpu>=0?g_requested_gpu:g->card_num;
+    char card[160];
+    snprintf(card,sizeof(card),"card%d (unavailable)",desired);
+    for(int i=0;i<ngpu;i++) if(gpus[i].card_num==desired)
+        snprintf(card,sizeof(card),"card%d - %.80s",desired,gpus[i].full_name);
+    draw_button(ui,settings_option_rect(ui,6),card,false);
+    gui_text(ui,x,settings_option_rect(ui,6).y+44,ui->dim,false,"%d card(s) detected  |  active: card%d",ngpu,g->card_num);
+    draw_button(ui,settings_unlock_rect(ui),"LOCKED - planned feature",false);
+    draw_button(ui,settings_gpu_switch_rect(ui),"APPLY GPU",false);
+    gui_text(ui,x+126,settings_gpu_switch_rect(ui).y+17,ui->warn,false,
+             "Rebind pauses watchdog, clears clock locks, disarms tuning.");
+    int y=settings_gpu_switch_rect(ui).y+51;
+    gui_text(ui,x,y,ui->dim,false,"Configuration: ~/.config/amd-gpu-diagnostic/settings.ini (invoking user)");y+=22;
+    gui_text(ui,x,y,ui->dim,false,"Project Maya engine lines and llama.cpp/Bionic timing supported.");y+=22;
+    gui_text(ui,x,y,ui->dim,false,"Manual log file requires an absolute readable path. Changes auto-save.");
+}
+
 static void draw_help_page(Gui *ui) {
-    int x=18,y=385;
+    int x=UI_MARGIN,y=UI_PAGE_Y+16;
     gui_text(ui,x,y,ui->accent,true,"Keyboard / mouse controls"); y+=30;
     const char *lines[] = {
         "1 Auto    2 Low    3 High    4 Standard    5 Min-GFX    6 Min-MEM    7 Peak    8 Manual",
-        "0 Home    P Clients    G Power    U Tuning    W Desktop    E Events    R Trace    H Help    I About",
+        "0 Home  P Clients  G Power  U Tuning  W Desktop  E Events  R Trace  F Settings  H Help  I About",
         "Space pause/resume watchdog    A adaptive burst    C DPM clock telemetry",
         "+ faster watchdog    - slower watchdog    D cycle DPM telemetry rate",
         "S cycle manual GFX level    M cycle manual memory level    X clear manual level locks",
         "U tuning page    T kernel trace on/off    L CSV event logging on/off    Q quit",
         "Tuning writes require ARM then APPLY. RESET STOCK uses driver reset and captured stock power cap.",
-        "All tabs, power modes, and the main toggles are also clickable.",
+        "All tabs, power modes, and toggles are clickable. Help is the small ? tab.",
         "The GUI uses plain Xlib: no GTK, Qt, ncurses, Electron, XCB, or libdrm dependency."
     };
     for(size_t i=0;i<sizeof(lines)/sizeof(lines[0]);i++) { gui_text(ui,x,y,ui->fg,false,"%s",lines[i]); y+=28; }
 }
 
 static void draw_about_page(Gui *ui) {
-    int x = 18, y = 385;
-
-    gui_text(ui, x, y, ui->accent, true, "AMD GPU Performance and Diagnostic Tool"); y += 32;
-    gui_text(ui, x, y, ui->fg, true, "Version %s", VERSION); y += 26;
-    gui_text(ui, x, y, ui->fg, false, "GitHub: kevito666"); y += 24;
-    gui_text(ui, x, y, ui->fg, false, "Username: satan"); y += 24;
-    gui_text(ui, x, y, ui->fg, false, "Build: %s", __DATE__); y += 24;
-    gui_text(ui, x, y, ui->dim, false, "(C) 2026 kevito666 (github)"); y += 34;
-
-    gui_text(ui, x, y, ui->accent, true, "About the project"); y += 28;
-    gui_text(ui, x, y, ui->fg, false,
-             "Independent Linux AMDGPU diagnostic software."); y += 22;
-    gui_text(ui, x, y, ui->fg, false,
-             "The project grew from investigating rapid AMDGPU power-state changes, desktop/game"); y += 22;
-    gui_text(ui, x, y, ui->fg, false,
-             "rendering interactions, and associated coil-whine behavior on real hardware."); y += 32;
-
-    gui_text(ui, x, y, ui->accent, true, "Technology"); y += 28;
-    gui_text(ui, x, y, ui->fg, false,
-             "C / Xlib / sysfs / procfs / debugfs / tracefs / DRM fdinfo"); y += 22;
-    gui_text(ui, x, y, ui->fg, false,
-             "X11/XLibre-first; intentionally avoids GTK, Qt, Electron, ncurses, libdrm, and Python."); y += 32;
-
-    gui_text(ui, x, y, ui->accent, true, "Development"); y += 28;
-    gui_text(ui, x, y, ui->fg, false,
-             "Project direction, hardware testing, and technical decisions remain under direct developer review."); y += 22;
-    gui_text(ui, x, y, ui->fg, false,
-             "AI-assisted development tools are used to accelerate implementation, testing, review,"); y += 22;
-    gui_text(ui, x, y, ui->fg, false,
-             "and documentation."); y += 32;
-
-    gui_text(ui, x, y, ui->accent, true, "License"); y += 28;
-    gui_text(ui, x, y, ui->fg, false,
-             "GNU General Public License version 3 or later (GPL-3.0-or-later)."); y += 36;
-
-    gui_text(ui, x, y, ui->warn, true,
-             "Built because listening to a GPU scream is not a diagnostic method.");
+    int x=UI_MARGIN,y=UI_PAGE_Y+16;
+    gui_text(ui,x,y,ui->accent,true,"AMD GPU Performance & Diagnostic Tool"); y+=28;
+    gui_text(ui,x,y,ui->fg,true,"v%s  |  beta release  |  compiled %s",VERSION,__DATE__); y+=24;
+    gui_text(ui,x,y,ui->fg,false,"Developer: kevito666   |   GitHub: github.com/kevito666"); y+=29;
+    gui_text(ui,x,y,ui->accent,true,"How it started"); y+=25;
+    gui_text(ui,x,y,ui->fg,false,"What started as a GPU coil-whine reducer / power-state controller"); y+=21;
+    gui_text(ui,x,y,ui->fg,false,"morphed into a full-blown AI and gaming desktop monitoring"); y+=21;
+    gui_text(ui,x,y,ui->fg,false,"and configuration tool!"); y+=27;
+    gui_text(ui,x,y,ui->fg,true,"Built in Tohoku, Japan."); y+=32;
+    gui_text(ui,x,y,ui->accent,true,"Technology"); y+=25;
+    gui_text(ui,x,y,ui->fg,false,"C / Xlib / AMDGPU sysfs / procfs / debugfs / tracefs / DRM fdinfo"); y+=21;
+    gui_text(ui,x,y,ui->fg,false,"Lightweight X11/XLibre; no GTK, Qt or Electron."); y+=28;
+    gui_text(ui,x,y,ui->accent,true,"License"); y+=25;
+    gui_text(ui,x,y,ui->fg,true,"SPDX: GPL-3.0-or-later"); y+=21;
+    gui_text(ui,x,y,ui->fg,false,"GNU General Public License, version 3 or (at your option) later."); y+=22;
+    gui_text(ui,x,y,ui->dim,false,"Copyright (C) 2026 Kevin Kolasa. See LICENSE in the source archive."); y+=26;
+    gui_text(ui,x,y,ui->warn,false,"Overclock unlock remains disabled in this beta.");
 }
 
 static void draw_bottom_controls(Gui *ui, const Target *t, bool adaptive, bool monitor_clocks,
@@ -4145,6 +5691,8 @@ static void draw_bottom_controls(Gui *ui, const Target *t, bool adaptive, bool m
 
 }
 
+static int gui_max_scroll(const Gui *ui, View view);
+
 static void gui_draw(Gui *ui, const Gpu *g, Sysfs *s, const Target *t, const Stats *st,
                      int interval_us, int dpm_interval_us, bool monitor_clocks, bool adaptive,
                      const ClientMonitor *clients, const PowerTelemetry *power, const SystemTelemetry *system, const SessionInfo *session,
@@ -4153,6 +5701,11 @@ static void gui_draw(Gui *ui, const Gpu *g, Sysfs *s, const Target *t, const Sta
     gui_fill(ui,(Rect){0,0,ui->width,ui->height},ui->bg);
     draw_header(ui,g,s,t,power,system,st);
     draw_tabs(ui,view);
+    ui->draw_offset_y = UI_CONTENT_TOP - UI_PAGE_Y - ui->scroll_y;
+    XRectangle clip = {(short)0, (short)UI_CONTENT_TOP, (unsigned short)ui->width,
+                       (unsigned short)gui_content_height(ui)};
+    XSetClipRectangles(ui->dpy,ui->gc,0,0,&clip,1,Unsorted);
+    ui->text_right = 0;
     switch(view) {
         case VIEW_DASHBOARD: draw_dashboard(ui,g,s,t,st,interval_us,adaptive,monitor_clocks,clients,power,session,events,trace,system); break;
         case VIEW_CLIENTS: draw_clients_page(ui,clients); break;
@@ -4161,11 +5714,27 @@ static void gui_draw(Gui *ui, const Gpu *g, Sysfs *s, const Target *t, const Sta
         case VIEW_DESKTOP: draw_desktop_page(ui,session); break;
         case VIEW_EVENTS: draw_events_page(ui,events); break;
         case VIEW_TRACE: draw_trace_page(ui,trace); break;
+        case VIEW_SETTINGS: draw_settings_page(ui,g,g_gpu_inventory,g_gpu_inventory_count); break;
         case VIEW_HELP: draw_help_page(ui); break;
         case VIEW_ABOUT: draw_about_page(ui); break;
     }
-    if(message && *message) gui_text(ui,16,ui->height-84,ui->warn,false,"%s",message);
+    XSetClipMask(ui->dpy,ui->gc,None);
+    ui->draw_offset_y = 0;
+    ui->text_right = 0;
+    if(message && *message) gui_text(ui,UI_MARGIN,ui->height-45,ui->warn,false,"%s",message);
     draw_bottom_controls(ui,t,adaptive,monitor_clocks,trace,events);
+    /* Subtle vertical scroll thumb; content continues below when this is visible. */
+    int max_scroll = gui_max_scroll(ui, view);
+    if (max_scroll > 0) {
+        int track_h = gui_content_height(ui) - 10;
+        int thumb_h = (track_h * gui_content_height(ui)) /
+                      (gui_content_height(ui) + max_scroll);
+        if (thumb_h < 24) thumb_h = 24;
+        int thumb_y = UI_CONTENT_TOP + 5 +
+                      (track_h - thumb_h) * ui->scroll_y / max_scroll;
+        gui_fill(ui,(Rect){ui->width-6,UI_CONTENT_TOP+5,3,track_h},ui->panel_alt);
+        gui_fill(ui,(Rect){ui->width-6,thumb_y,3,thumb_h},ui->accent);
+    }
     XFlush(ui->dpy);
     ui->dirty=false;
 }
@@ -4184,8 +5753,19 @@ static int cycle_manual_level(Sysfs *s, Target *t, bool sclk, char *message, siz
     int current=sclk?(t->lock_sclk?t->sclk_level:active):(t->lock_mclk?t->mclk_level:active);
     int pos=-1; for(int i=0;i<nv;i++) if(valid[i]==current){pos=i;break;}
     int wanted=valid[(pos+1+nv)%nv];
+    /* Only commit the target after both driver writes succeed. A rejected
+     * level must not leave the watchdog enforcing a phantom manual target. */
+    if (apply_policy(s,"manual") < 0) {
+        snprintf(message,cap,"Cannot enter manual mode for %s: %s",sclk?"GFX":"memory",strerror(errno));
+        return -1;
+    }
+    if (apply_level(wfd,wanted) < 0) {
+        int saved = errno;
+        (void)apply_policy(s,t->policy); /* best-effort driver rollback */
+        snprintf(message,cap,"Driver rejected manual %s level %d: %s",sclk?"GFX":"memory",wanted,strerror(saved));
+        return -1;
+    }
     snprintf(t->policy,sizeof(t->policy),"manual");
-    if(apply_policy(s,"manual")<0 || apply_level(wfd,wanted)<0) { snprintf(message,cap,"Failed to apply manual %s level %d",sclk?"GFX":"memory",wanted); return -1; }
     if(sclk){t->lock_sclk=true;t->sclk_level=wanted;}else{t->lock_mclk=true;t->mclk_level=wanted;}
     snprintf(message,cap,"Manual %s level -> %d",sclk?"GFX":"memory",wanted);
     return 0;
@@ -4256,10 +5836,15 @@ static void usage(const char *argv0) {
 
 static void set_mode(Sysfs *s, Target *t, int idx, char *message, size_t cap) {
     if(idx<0||idx>=(int)POLICY_COUNT)return;
-    snprintf(t->policy,sizeof(t->policy),"%s",POLICIES[idx]);
-    if(strcmp(t->policy,"manual")!=0){t->lock_sclk=false;t->lock_mclk=false;}
-    if(apply_policy(s,t->policy)==0) snprintf(message,cap,"Target changed to %s",t->policy);
-    else snprintf(message,cap,"Failed to apply %s: %s",t->policy,strerror(errno));
+    const char *requested = POLICIES[idx];
+    if (apply_policy(s,requested) == 0) {
+        /* Desired policy now matches the driver-accepted write. */
+        text_copy(t->policy,sizeof(t->policy),requested);
+        if(strcmp(requested,"manual")!=0){t->lock_sclk=false;t->lock_mclk=false;}
+        snprintf(message,cap,"Target changed to %s",t->policy);
+    } else {
+        snprintf(message,cap,"Failed to apply %s: %s",requested,strerror(errno));
+    }
 }
 
 static void handle_action(char key, Sysfs *s, Target *target, int *interval_us, int *dpm_interval_us,
@@ -4275,6 +5860,7 @@ static void handle_action(char key, Sysfs *s, Target *target, int *interval_us, 
     else if(key=='e'||key=='E') *view=VIEW_EVENTS;
     else if(key=='r'||key=='R') *view=VIEW_TRACE;
     else if(key=='h'||key=='H'||key=='?') *view=VIEW_HELP;
+    else if(key=='f'||key=='F') *view=VIEW_SETTINGS;
     else if(key=='i'||key=='I') *view=VIEW_ABOUT;
     else if(key==' '){target->enabled=!target->enabled;snprintf(message,message_cap,"Watchdog %s",target->enabled?"enabled":"paused");}
     else if(key=='a'||key=='A'){*adaptive=!*adaptive;*burst_until_ns=0;snprintf(message,message_cap,"Adaptive correction burst %s",*adaptive?"enabled":"disabled");}
@@ -4291,6 +5877,36 @@ static void handle_action(char key, Sysfs *s, Target *target, int *interval_us, 
         else if(trace_start(trace)==0)snprintf(message,message_cap,"Kernel trace started");
         else snprintf(message,message_cap,"Kernel trace unavailable or failed to start");
     }
+}
+
+/* Full logical content extent per page. All content retains its original coordinates. */
+static int gui_page_end(View view) {
+    switch (view) {
+        case VIEW_DASHBOARD: return g_workflow == WORKFLOW_GAMING ? UI_PAGE_Y+4*103+8 : UI_PAGE_Y+180+7+2*103+8;
+        case VIEW_CLIENTS: return 760;
+        case VIEW_POWER: return 1020;
+        case VIEW_TUNING: return 797;
+        case VIEW_DESKTOP: return UI_PAGE_Y+560;
+        case VIEW_EVENTS: return UI_PAGE_Y+15*18+75;
+        case VIEW_SETTINGS: return UI_PAGE_Y+41+8*59+125;
+        case VIEW_TRACE: return 670;
+        case VIEW_HELP: return 715;
+        case VIEW_ABOUT: return UI_PAGE_Y+430;
+        default: return 745;
+    }
+}
+
+static int gui_max_scroll(const Gui *ui, View view) {
+    int excess = gui_page_end(view) - UI_PAGE_Y - gui_content_height(ui);
+    return excess > 0 ? excess : 0;
+}
+
+static void gui_scroll(Gui *ui, View view, int delta) {
+    ui->scroll_y += delta;
+    if (ui->scroll_y < 0) ui->scroll_y = 0;
+    int max = gui_max_scroll(ui, view);
+    if (ui->scroll_y > max) ui->scroll_y = max;
+    ui->dirty = true;
 }
 
 static char keysym_to_action(XKeyEvent *ke) {
@@ -4315,6 +5931,32 @@ static bool tuning_row_available(const TuningState *t, int row) {
     }
 }
 
+/* Launch viewer without a root shell or shell interpolation of filenames. */
+static bool open_ai_log_viewer(const char *path) {
+    if (!path || path[0] != '/') return false;
+    pid_t starter = fork();
+    if (starter < 0) return false;
+    if (starter == 0) {
+        pid_t viewer = fork();
+        if (viewer < 0) _exit(127);
+        if (viewer > 0) _exit(0); /* double fork: no retained GUI zombie */
+        const char *sudo_user = getenv("SUDO_USER");
+        if (geteuid() == 0) {
+            /* Never launch xdg-open with root privileges. Require a genuine
+             * invoking-user identity, even on a direct-root invocation. */
+            if (!sudo_user || !*sudo_user) _exit(126);
+            struct passwd *pw = getpwnam(sudo_user);
+            if (!pw || pw->pw_uid == 0 || setgroups(0, NULL) != 0 ||
+                setgid(pw->pw_gid) != 0 || setuid(pw->pw_uid) != 0) _exit(126);
+            (void)setenv("HOME", pw->pw_dir, 1);
+        }
+        execlp("xdg-open", "xdg-open", path, (char *)NULL);
+        _exit(127);
+    }
+    (void)waitpid(starter, NULL, 0);
+    return true;
+}
+
 static void handle_click(Gui *ui, int x, int y, Sysfs *s, Target *target, TuningState *tuning,
                          int *interval_us, int *dpm_interval_us, bool *monitor_clocks, bool *adaptive,
                          long long *burst_until_ns, TraceState *trace, EventLog *events,
@@ -4322,30 +5964,73 @@ static void handle_click(Gui *ui, int x, int y, Sysfs *s, Target *target, Tuning
     /* Workflow mode buttons */
     if(point_in(workflow_rect(ui, 0), x, y)) {
         g_workflow = WORKFLOW_AI;
+        ui->scroll_y = 0;
         snprintf(message, message_cap, "AI Workflow mode");
         return;
     }
     if(point_in(workflow_rect(ui, 1), x, y)) {
         g_workflow = WORKFLOW_GAMING;
+        ui->scroll_y = 0;
         snprintf(message, message_cap, "Gaming Workflow mode");
         return;
     }
 
-    /* Token source button - cycle through sources */
-    if(point_in(token_source_rect(ui), x, y)) {
-        g_token_source = (TokenSource)((g_token_source + 1) % 4);
-        switch (g_token_source) {
-            case TOKEN_SOURCE_HEURISTIC: snprintf(message, message_cap, "Token source: Heuristic"); break;
-            case TOKEN_SOURCE_LLAMA: snprintf(message, message_cap, "Token source: llama.cpp"); break;
-            case TOKEN_SOURCE_OLLAMA: snprintf(message, message_cap, "Token source: Ollama"); break;
-            case TOKEN_SOURCE_VLLM: snprintf(message, message_cap, "Token source: vLLM"); break;
-        }
+    if(*view==VIEW_SETTINGS && y>=UI_CONTENT_TOP && y<gui_content_bottom(ui)) {
+        int ly=y-(UI_CONTENT_TOP-UI_PAGE_Y-ui->scroll_y);
+        if(point_in(settings_option_rect(ui,0),x,ly)) {
+            g_settings.token_source=(TokenSource)((g_settings.token_source+1)%TOKEN_SOURCE_COUNT);
+            g_token_source=g_settings.token_source;
+        } else if(point_in(settings_option_rect(ui,1),x,ly)) {
+            g_settings.log_parser=(LogParser)((g_settings.log_parser+1)%LOG_COUNT);
+        } else if(point_in(settings_option_rect(ui,2),x,ly)) {
+            g_settings.ai_log_manual=!g_settings.ai_log_manual;
+        } else if(point_in(settings_path_rect(ui),x,ly)) {
+            g_edit_ai_path=true;
+            text_copy(g_edit_path_buffer,sizeof(g_edit_path_buffer),g_settings.ai_log_file);
+            snprintf(message,message_cap,"Type an absolute path; Enter saves, Esc cancels.");
+            return;
+        } else if(point_in(settings_option_rect(ui,4),x,ly)) {
+            if(g_nvme.device_count) {
+                int idx=-1;
+                for(int i=0;i<g_nvme.device_count;i++) if(!strcmp(g_nvme.selected,g_nvme.devices[i].name))idx=i;
+                nvme_select(&g_nvme,g_nvme.devices[(idx+1)%g_nvme.device_count].name);
+                text_copy(g_settings.ai_nvme_device,sizeof(g_settings.ai_nvme_device),g_nvme.selected);
+            }
+        } else if(point_in(settings_option_rect(ui,5),x,ly)) {
+            g_settings.compositor_source=(CompositorSource)((g_settings.compositor_source+1)%COMP_COUNT);
+        } else if(point_in(settings_option_rect(ui,6),x,ly)) {
+            int pos=0;
+            for(int i=0;i<g_gpu_inventory_count;i++) if(g_gpu_inventory[i].card_num==g_requested_gpu) pos=i;
+            if(g_gpu_inventory_count>0) g_requested_gpu=g_gpu_inventory[(pos+1)%g_gpu_inventory_count].card_num;
+        } else if(point_in(settings_unlock_rect(ui),x,ly)) {
+            snprintf(message,message_cap,"Overclock unlock is not implemented in v0.7.0b (safe placeholder).");
+            return;
+        } else if(point_in(settings_gpu_switch_rect(ui),x,ly)) {
+            g_gpu_switch_requested=true;
+            snprintf(message,message_cap,"GPU switch requested; tuning will be disarmed.");
+            return;
+        } else return;
+        if(settings_save()) snprintf(message,message_cap,"Settings saved.");
+        else snprintf(message,message_cap,"Could not save settings to user config directory.");
         return;
     }
 
+    /* View AI log button */
+    if (g_ai_log_path[0] != 0 && *view == VIEW_DASHBOARD && g_workflow == WORKFLOW_AI) {
+        Rect log_btn = ai_log_button_rect(ui);
+        int content_y = y - (UI_CONTENT_TOP - UI_PAGE_Y - ui->scroll_y);
+        if (y >= UI_CONTENT_TOP && y < gui_content_bottom(ui) && point_in(log_btn, x, content_y)) {
+            snprintf(message, message_cap, "%s", open_ai_log_viewer(g_ai_log_path) ?
+                     "Opening AI log" : "Unable to start AI log viewer");
+            return;
+        }
+    }
+
+    if(point_in(help_rect(ui),x,y)) { *view=VIEW_HELP; ui->scroll_y=0; message[0]=0; return; }
     for(int i=0;i<9;i++) {
         if(point_in(tab_rect(ui,i),x,y)) {
             *view=(View)i;
+            ui->scroll_y=0;
             message[0]=0;
             return;
         }
@@ -4357,33 +6042,34 @@ static void handle_click(Gui *ui, int x, int y, Sysfs *s, Target *target, Tuning
         }
     }
 
-    if (*view == VIEW_TUNING) {
+    if (*view == VIEW_TUNING && y >= UI_CONTENT_TOP && y < gui_content_bottom(ui)) {
+        int logical_y = y - (UI_CONTENT_TOP - UI_PAGE_Y - ui->scroll_y);
         for (int row=0; row<5; row++) {
-            if (point_in(tuning_minus_rect(ui,row),x,y) || point_in(tuning_plus_rect(ui,row),x,y)) {
+            if (point_in(tuning_minus_rect(ui,row),x,logical_y) || point_in(tuning_plus_rect(ui,row),x,logical_y)) {
                 if (!tuning_row_available(tuning,row)) {
                     snprintf(message,message_cap,"That tuning control is not exposed by this ASIC/driver.");
                     return;
                 }
-                int dir=point_in(tuning_minus_rect(ui,row),x,y)?-1:+1;
+                int dir=point_in(tuning_minus_rect(ui,row),x,logical_y)?-1:+1;
                 tuning_adjust(tuning,row,dir);
                 snprintf(message,message_cap,"Tuning edit changed; ARM + APPLY required to write.");
                 return;
             }
         }
-        if (point_in(tuning_action_rect(ui,0),x,y)) {
+        if (point_in(tuning_action_rect(ui,0),x,logical_y)) {
             tuning->armed = !tuning->armed;
             snprintf(message,message_cap,"Tuning writes %s.",tuning->armed?"ARMED":"disarmed");
             return;
         }
-        if (point_in(tuning_action_rect(ui,1),x,y)) {
+        if (point_in(tuning_action_rect(ui,1),x,logical_y)) {
             (void)tuning_apply(s,target,tuning,message,message_cap);
             return;
         }
-        if (point_in(tuning_action_rect(ui,2),x,y)) {
+        if (point_in(tuning_action_rect(ui,2),x,logical_y)) {
             (void)tuning_reset(s,target,tuning,message,message_cap);
             return;
         }
-        if (point_in(tuning_action_rect(ui,3),x,y)) {
+        if (point_in(tuning_action_rect(ui,3),x,logical_y)) {
             tuning_refresh(s,tuning,false);
             snprintf(message,message_cap,"Tuning state refreshed from driver.");
             return;
@@ -4401,6 +6087,10 @@ int main(int argc, char **argv) {
     int requested_card=-1, interval_us=DEFAULT_INTERVAL_US, dpm_interval_us=DEFAULT_DPM_INTERVAL_US;
     bool monitor_clocks=false, adaptive=true, unsafe_fast=false, lower_priority=true, bench_at_start=false;
     Target target={.policy="profile_standard",.enabled=true,.lock_sclk=false,.lock_mclk=false,.sclk_level=0,.mclk_level=0};
+    settings_load();
+    if(g_settings.ai_nvme_device[0]) nvme_select(&g_nvme,g_settings.ai_nvme_device);
+    nvme_discover(&g_nvme);
+    requested_card=g_settings.preferred_card;
 
     for(int i=1;i<argc;i++){
         if(strcmp(argv[i],"--help")==0||strcmp(argv[i],"-h")==0){usage(argv[0]);return 0;}
@@ -4431,10 +6121,13 @@ int main(int argc, char **argv) {
     sigaction(SIGINT,&sa,NULL); sigaction(SIGTERM,&sa,NULL); sigaction(SIGHUP,&sa,NULL);
 
     Gpu gpus[16]; int ngpu=detect_amd_gpus(gpus,16);
+    g_gpu_inventory_count=ngpu>0?ngpu:0;
+    if(ngpu>0) memcpy(g_gpu_inventory,gpus,(size_t)ngpu*sizeof(Gpu));
     if(ngpu<=0){fprintf(stderr,"No AMD DRM GPUs found.\n");return 1;}
     int gi=choose_gpu(gpus,ngpu,requested_card);
     if(gi<0){fprintf(stderr,"Requested AMD GPU not found.\n");return 1;}
     Gpu *g=&gpus[gi]; Sysfs s;
+    g_requested_gpu=g->card_num;
     if(sysfs_open(g,&s)<0){fprintf(stderr,"Cannot open AMDGPU controls: %s\n",strerror(errno));return 1;}
     if(apply_policy(&s,target.policy)<0){fprintf(stderr,"Cannot set initial policy %s: %s\n",target.policy,strerror(errno));sysfs_close(&s);return 1;}
     if(bench_at_start){run_benchmark_cli(&s);sysfs_close(&s);return 0;}
@@ -4446,18 +6139,25 @@ int main(int argc, char **argv) {
                           .gfx_hz=-1,.mem_hz=-1,.gfxoff_enabled=-1,.gfxoff_status=-1,.last_gfxoff_status=-1};
     for (int i=0;i<MAX_GPU_TEMPS;i++) power.temps_c[i]=-1.0;
     SystemTelemetry system={0};
+    system.cpu_power_w=-1;
     system.fd_cpu_temp=-1;
+    system.fd_cpu_tctl=-1;
+    system.cpu_tctl_c=-1;
+    system.cpu_boost=-1;
+    system.cpu_smt=-1;
     system.cpu_temp_c=-1.0;
     system.cpu_temp_crit_mc=-1;
     TuningState tuning={0};
     tuning.spec=gpu_spec_match(g->full_name,g->vram_bytes);
     SessionInfo session={0}; EventLog events={0}; TraceState trace; trace_discover(&trace);
-    
+
     /* Initialize curl and detect AI servers */
     curl_global_init(CURL_GLOBAL_DEFAULT);
-    system.token_source = TOKEN_SOURCE_HEURISTIC;
+    system.token_source = g_token_source;
     detect_ai_servers(&system);
-    
+    detect_ai_model_info(&system);
+    detect_ai_log(&system);
+
     sample_power(&s,&power); sample_system(&system); sample_clients(g,&clients); sample_session(g,&s,&session,&clients);
     tuning_refresh(&s,&tuning,true);
 
@@ -4494,31 +6194,111 @@ int main(int argc, char **argv) {
             if(oldpw>=0&&power.power_w>=0&&fabs(power.power_w-oldpw)>30.0){char d[128];snprintf(d,sizeof(d),"%.1f W -> %.1f W",oldpw,power.power_w);event_log_add(&events,"POWER STEP",d,&clients,&trace);}
             next_power=loop_now;add_ns(&next_power,POWER_SAMPLE_NS);ui.dirty=true;
         }
-        if(diff_ns(loop_now,next_system)>=0){sample_system(&system);system.token_source=g_token_source;sample_tokens(&system,power.power_w);next_system=loop_now;add_ns(&next_system,SYSTEM_SAMPLE_NS);ui.dirty=true;}
-        if(diff_ns(loop_now,next_session)>=0){sample_session(g,&s,&session,&clients);x11_probe_session(&ui,&session);next_session=loop_now;add_ns(&next_session,SESSION_SAMPLE_NS);ui.dirty=true;}
+        if(diff_ns(loop_now,next_system)>=0){sample_system(&system);nvme_sample(&g_nvme);system.token_source=g_token_source;sample_tokens(&system,power.power_w);parse_ai_log(&system);next_system=loop_now;add_ns(&next_system,SYSTEM_SAMPLE_NS);ui.dirty=true;}
+        if(diff_ns(loop_now,next_session)>=0){sample_session(g,&s,&session,&clients);x11_probe_session(&ui,&session);detect_ai_model_info(&system);next_session=loop_now;add_ns(&next_session,SESSION_SAMPLE_NS);ui.dirty=true;}
         trace_pump(&trace);
 
         while(XPending(ui.dpy)>0){
             XEvent ev;XNextEvent(ui.dpy,&ev);
             if(ev.type==Expose){ui.dirty=true;}
-            else if(ev.type==ConfigureNotify){ui.width=ev.xconfigure.width;ui.height=ev.xconfigure.height;ui.dirty=true;}
+            else if(ev.type==ConfigureNotify){
+                ui.width=ev.xconfigure.width;ui.height=ev.xconfigure.height;
+                gui_scroll(&ui,view,0);
+            }
             else if(ev.type==ClientMessage&&(Atom)ev.xclient.data.l[0]==ui.wm_delete){g_stop=1;break;}
             else if(ev.type==KeyPress){
+                KeySym ks = XLookupKeysym(&ev.xkey,0);
+                if(g_edit_ai_path) {
+                    if(ks==XK_Escape) { g_edit_ai_path=false; snprintf(message,sizeof(message),"Log path edit cancelled."); }
+                    else if(ks==XK_Return || ks==XK_KP_Enter) {
+                        if(g_edit_path_buffer[0]=='/' && strlen(g_edit_path_buffer)<MAX_PATH_LEN-1) {
+                            text_copy(g_settings.ai_log_file,sizeof(g_settings.ai_log_file),g_edit_path_buffer);
+                            g_settings.ai_log_manual=true;
+                            g_edit_ai_path=false;
+                            snprintf(message,sizeof(message),settings_save()?"AI log path saved.":"Failed to save AI log path.");
+                            system.ai_log_last_detect=0;
+                        } else snprintf(message,sizeof(message),"Absolute path required (begins with /). Esc to cancel.");
+                    } else if(ks==XK_BackSpace) {
+                        size_t n=strlen(g_edit_path_buffer); if(n)g_edit_path_buffer[n-1]=0;
+                    } else {
+                        char ch[16]={0}; KeySym temp;
+                        int len=XLookupString(&ev.xkey,ch,sizeof(ch),&temp,NULL);
+                        size_t n=strlen(g_edit_path_buffer);
+                        if(len>0 && n+(size_t)len<sizeof(g_edit_path_buffer)-1) {
+                            bool printable=true;
+                            for(int k=0;k<len;k++) if((unsigned char)ch[k]<32 || ch[k]=='\n' || ch[k]=='\r') printable=false;
+                            if(printable) strncat(g_edit_path_buffer,ch,sizeof(g_edit_path_buffer)-n-1);
+                        }
+                    }
+                    ui.dirty=true;
+                    continue;
+                }
+
+                if (ks == XK_Page_Down || ks == XK_Page_Up || ks == XK_Home || ks == XK_End) {
+                    int delta = ks == XK_Page_Down ? gui_content_height(&ui)-40 :
+                                ks == XK_Page_Up ? -(gui_content_height(&ui)-40) :
+                                ks == XK_Home ? -100000 : 100000;
+                    gui_scroll(&ui,view,delta);
+                    continue;
+                }
                 char key=keysym_to_action(&ev.xkey); if(key=='q'||key=='Q'){g_stop=1;break;}
-                if(key){handle_action(key,&s,&target,&interval_us,&dpm_interval_us,&monitor_clocks,&adaptive,&burst_until_ns,&trace,&events,&view,message,sizeof(message));ui.dirty=true;}
+                if(key){
+                    View old_view = view;
+                    handle_action(key,&s,&target,&interval_us,&dpm_interval_us,&monitor_clocks,&adaptive,&burst_until_ns,&trace,&events,&view,message,sizeof(message));
+                    if (view != old_view) ui.scroll_y = 0;
+                    ui.dirty=true;
+                }
             } else if(ev.type==ButtonPress){
+                if ((ev.xbutton.button == Button4 || ev.xbutton.button == Button5) &&
+                    ev.xbutton.y >= UI_CONTENT_TOP && ev.xbutton.y < gui_content_bottom(&ui)) {
+                    gui_scroll(&ui,view,ev.xbutton.button == Button4 ? -54 : 54);
+                    continue;
+                }
+                if (ev.xbutton.button != Button1) continue;
                 handle_click(&ui,ev.xbutton.x,ev.xbutton.y,&s,&target,&tuning,&interval_us,&dpm_interval_us,&monitor_clocks,&adaptive,&burst_until_ns,&trace,&events,&view,message,sizeof(message));ui.dirty=true;
             }
         }
 
+        if(g_gpu_switch_requested) {
+            g_gpu_switch_requested=false;
+            int newgi=-1;
+            for(int i=0;i<ngpu;i++) if(gpus[i].card_num==g_requested_gpu) newgi=i;
+            if(newgi<0) snprintf(message,sizeof(message),"Selected AMD GPU no longer available.");
+            else if(newgi==gi) snprintf(message,sizeof(message),"Already monitoring selected GPU.");
+            else {
+                Sysfs nextsys;
+                if(sysfs_open(&gpus[newgi],&nextsys)!=0)
+                    snprintf(message,sizeof(message),"Cannot open selected card%d: %s",g_requested_gpu,strerror(errno));
+                else {
+                    /* No new GPU policy writes until the user re-enables the watchdog. */
+                    target.enabled=false; target.lock_sclk=false; target.lock_mclk=false;
+                    tuning.armed=false;
+                    sysfs_close(&s); s=nextsys;
+                    gi=newgi;g=&gpus[gi];
+                    memset(&power,0,sizeof(power));power.gpu_busy=power.mem_busy=-1;
+                    power.power_w=power.voltage_v=power.current_a=-1;
+                    power.gfx_hz=power.mem_hz=-1;power.fan_rpm=-1;
+                    power.gfxoff_enabled=power.gfxoff_status=-1;
+                    for(int i=0;i<MAX_GPU_TEMPS;i++) power.temps_c[i]=-1;
+                    memset(&clients,0,sizeof(clients));memset(&tuning,0,sizeof(tuning));
+                    tuning.spec=gpu_spec_match(g->full_name,g->vram_bytes);
+                    sample_power(&s,&power);sample_clients(g,&clients);
+                    tuning_refresh(&s,&tuning,true);
+                    sample_session(g,&s,&session,&clients);x11_probe_session(&ui,&session);
+                    g_settings.preferred_card=g->card_num;
+                    (void)settings_save();
+                    event_log_add(&events,"GPU SWITCH","Monitoring rebound; watchdog paused",&clients,&trace);
+                    snprintf(message,sizeof(message),"Switched to card%d. Watchdog PAUSED; tuning DISARMED.",g->card_num);
+                }
+            }
+            ui.dirty=true;
+        }
         clock_gettime(CLOCK_MONOTONIC,&loop_now);
         if(diff_ns(loop_now,stat_wall0)>=1000000000LL){
             struct timespec cpu1;clock_gettime(CLOCK_THREAD_CPUTIME_ID,&cpu1);double wall=diff_ns(loop_now,stat_wall0)/1e9,cpu=diff_ns(cpu1,stat_cpu0)/1e9;uint64_t dc=st.checks-stat_checks0;
             st.loop_cpu_pct=wall>0?cpu/wall*100.0:0.0;st.loop_hz=wall>0?dc/wall:0.0;stat_wall0=loop_now;stat_cpu0=cpu1;stat_checks0=st.checks;ui.dirty=true;
         }
         if(ui.dirty&&diff_ns(loop_now,last_ui)>=250000000LL){
-            double ft_ms = diff_ns(loop_now,last_ui)/1000000.0;
-            if(ft_ms > 0.0 && ft_ms < 1000.0) record_frametime(&system.frametimes, ft_ms);
             gui_draw(&ui,g,&s,&target,&st,interval_us,dpm_interval_us,monitor_clocks,adaptive,&clients,&power,&system,&session,&events,&trace,&tuning,view,message);
             last_ui=loop_now;
         }
@@ -4527,5 +6307,7 @@ int main(int argc, char **argv) {
         if(diff_ns(next,now)>0)clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&next,NULL);else{st.deadline_misses++;next=now;}
     }
 
-    trace_stop(&trace);if(events.logf)fclose(events.logf);gui_close(&ui);if(system.fd_cpu_temp>=0)close(system.fd_cpu_temp);sysfs_close(&s);return 0;
+    trace_stop(&trace);if(events.logf)fclose(events.logf);cleanup_curl_handle();curl_global_cleanup();gui_close(&ui);if(system.fd_cpu_temp>=0)close(system.fd_cpu_temp);
+    if(system.fd_cpu_tctl>=0)close(system.fd_cpu_tctl);
+    sysfs_close(&s);return 0;
 }

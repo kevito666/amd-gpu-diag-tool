@@ -1,0 +1,16 @@
+name: C / X11 beta checks
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install C / X11 dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential libx11-dev libcurl4-openssl-dev xvfb xauth
+      - name: Strict compiler and tests
+        run: make check check-config check-parser check-pcie check-audit check-maya-nvme check-ui
+      - name: Build
+        run: make
