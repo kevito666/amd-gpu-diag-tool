@@ -1,267 +1,90 @@
-# AMD GPU Performance and Diagnostic Tool
+# AMD GPU Diagnostic Tool — v0.8.0 development
 
-**Development checkpoint 0.8.0-dev.16 · GPL-3.0-or-later · C / Xlib / AMDGPU · X11/XLibre**
+[![v0.8.0 development CI](https://github.com/kevito666/amd-gpu-diag-tool/actions/workflows/ci.yml/badge.svg?branch=refactor%2Fv0.8.0)](https://github.com/kevito666/amd-gpu-diag-tool/actions/workflows/ci.yml?query=branch%3Arefactor%2Fv0.8.0)
+[![main CI](https://github.com/kevito666/amd-gpu-diag-tool/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/kevito666/amd-gpu-diag-tool/actions/workflows/ci.yml?query=branch%3Amain)
 
-> **Development branch only.** The public beta remains `v0.7.0b`. This is
-> modular UI and timing refactor toward `v0.8.0b`, not a tagged GitHub release. It preserves
-> the existing interface and monitoring behavior. See
-> [the v0.8.0 refactor roadmap](docs/V080_REFACTOR.md).
+**Current checkpoint: `0.8.0-dev.16`** · C / Xlib / X11/XLibre · GPL-3.0-or-later
 
-What started as a coil-whine reducer and GPU power-state controller morphed into a full-blown AI and gaming desktop monitoring and configuration tool. Built in **Tohoku, Japan**.
+**This is the working branch, not a tagged beta.** The published [v0.7.0b release](https://github.com/kevito666/amd-gpu-diag-tool/releases/tag/v0.7.0b) and [`main`](https://github.com/kevito666/amd-gpu-diag-tool/tree/main) are still separate.
 
-A lightweight X11/XLibre-first diagnostics utility for Linux AMD GPUs. No GTK, Qt, Electron or Python runtime. Uses the kernel's sysfs, procfs, debugfs, tracefs and DRM fdinfo interfaces and an Xlib desktop UI. It currently requires root for its existing AMDGPU power-policy writes. **Review the code before running with sudo.**
+I started this project to get a handle on AMD GPU power states and coil whine. Now it covers most of the stuff I want to see while I'm running games, local AI models, or trying to figure out what my Linux desktop is doing. The goal for 0.8.0 is to make the code easier to maintain and keep slow monitoring calls out of the GPU watchdog's way—not to bolt on a pile of frameworks.
 
-## Screenshots — v0.7.0b running on AMD Radeon RX 7900 XTX
+## What changed since v0.7.0b?
 
-These are unmodified captures of the actual compact X11 interface, not simulated mockups. Hardware and AI readings are momentary observations, not benchmark results.
+- **Modular source:** GPU control/readback, monitoring, AI parsers, settings, Xlib UI, events/trace, and application timing are split into separate C modules.
+- **Two read-only workers:** One handles CPU/process/NVMe/AI work; the other scans DRM clients and desktop/compositor/session information. They return copied, generation-checked results, so an old GPU or AI-source selection cannot quietly overwrite the new one.
+- **GPU writes are still single-writer.** Tuning ARM/APPLY/RESET, policy control, and watchdog enforcement remain on the foreground control path. No new overclocking permissions were added.
+- **Watchdog profiler:** Opt-in timing now records check-to-check gaps, deadline misses, maximums, and latency buckets, so idle versus inference load can be compared on actual hardware.
+- **UI cleanup (dev.16):** Larger GPU name, `Target = … | Actual = … | LOCKED/PAUSED | Corrections = …`, two-column Settings, fixed About versus `?` Help navigation, centered tuning controls, and a scrolling Radeon reference database browser.
+
+The firmware's actual limits always override reference-card database values. The database is informational, **not** a set of safe overclock targets.
+
+## What it does
+
+The dashboards cover AMDGPU temperatures, power, clocks, DPM states, GPU clients, PCIe/BAR, CPU telemetry, display/VRR state, and compositor details. Local AI monitoring understands task timing from llama.cpp/Bionic and supported Project Maya engine logs. The NVMe tile reports **aggregate device I/O**, not per-model storage usage. Other AI sources and parser modes vary in completeness; unsupported measurements stay unavailable.
+
+The app is native C/Xlib. No GTK, Qt, Electron, or Python runtime is required to run it.
+
+### Screenshots
+
+These are real **v0.7.0b** screenshots from an RX 7900 XTX. The dev.16 UI has since changed; these are not mockups or current performance results.
 
 | AI monitoring | Gaming monitoring |
 |:---:|:---:|
-| ![AI monitoring dashboard with llama.cpp activity, prompt-cache state and selected NVMe device I/O](docs/screenshots/ai.png) | ![Gaming monitoring dashboard showing GPU thermals, CPU clocks, PCIe/BAR status, and hardware statistics](docs/screenshots/gaming.png) |
+| ![AI dashboard](docs/screenshots/ai.png) | ![Gaming dashboard](docs/screenshots/gaming.png) |
 
-The **AI** screenshot shows task-specific prompt/decode timing entries and the selected NVMe monitoring tile. The dashboard supports llama.cpp/Bionic timing logs and selectable Project Maya log parsing. **AI NVMe CACHE I/O** measures aggregate I/O on the selected NVMe namespace; it cannot identify which requests or processes generated the disk traffic. The **Gaming** dashboard reports AMDGPU and Linux hardware telemetry, not game-rendered FPS unless a real frame source is connected.
+## Build and test
 
-## v0.8.0 development modules
-
-The `0.8.0-dev.14` checkpoint hardens the two-worker architecture by resetting worker-private AI state on source generations, rejecting blocking nonregular log files, and testing in-flight shutdown/restart. Dev.13 also introduced generation-checked snapshots and detailed watchdog lateness reporting. Its original foundational modules remain:
-
-| Subsystem | Owner | Driver writes? |
-|---|---|---|
-| GPU device descriptors | `src/gpu/device.{c,h}` | Opens read/write handles; does not issue writes |
-| GPU readback | `src/gpu/readback.{c,h}` | **No** |
-| Watchdog policy + DPM inspection | `src/gpu/policy.{c,h}` | Through `gpu/writes` only |
-| Tuning ARM/APPLY/RESET and ranges | `src/gpu/tuning.{c,h}` | Through `gpu/writes` only |
-| Low-level GPU-control writes | `src/gpu/writes.{c,h}` | **Yes: one synchronous API** |
-| CPU, session, AI and NVMe collectors | `src/monitor/`, `src/ai/` | No GPU controls |
-
-| UI subsystem | Owner | Responsibility |
-|---|---|---|
-| Shared view state and page identifiers | `src/ui/types.h` | Shared between UI and controller |
-| Drawing and bars | `src/ui/draw.{c,h}` | Xlib only; no device writes |
-| Canonical hitboxes and scrolling | `src/ui/layout.{c,h}` | Pure geometry; headless testable |
-| Window lifetime and session X11 metadata | `src/ui/window.{c,h}` | Xlib only; compositor source passed explicitly |
-| AI / GAMING renderers | `src/ui/ai_dashboard.c`, `gaming.c`, `dashboards.h` | Read-only explicit inputs; no GPU writes |
-| Shared thermal presentation | `src/ui/status.{c,h}` | Read-only thresholds/palette |
-
-The `src/ui/input.c` module translates X11 actions and enforces bounds on
-AI log-path editing. Each controller event batch is capped at 64 events;
-this mitigates event-queue starvation but does not eliminate synchronous
-monitoring delays. For details see [dev.10 scheduling diagnostics](docs/V080_STEP10_SCHEDULER.md).
-
-The fixed dashboard header, power/thermal bars, policy buttons, tabs and footer
-controls now live in `src/ui/chrome.c`, receiving the workflow explicitly.
-The diagnostic event ring and tracefs instance lifecycle are implemented in
-`src/diagnostics/events.c` and `src/diagnostics/trace.c`; no X11 dependency.
-The opt-in `src/app/poll_timing.c` profiler records *wall-clock* costs for
-GPU clients, System+AI, desktop sessions, GPU power, DPM, tracefs, input,
-GPU switching and rendering, plus deadline lateness by severity bucket. The profile is printed to stderr on **normal application shutdown**;
-it makes no scheduling change and does not provide hard-real-time guarantees.
-
-The AI and GAMING pages remain in `src/ui/ai_dashboard.c` and `src/ui/gaming.c`.
-The new `src/ui/pages_monitor.c` owns the Clients, Power, Desktop, Events and Trace
-views, `pages_tuning.c` renders the 3×2 tuning tile grid, and `pages_settings.c`
-renders Settings, Help and About. `ui/pages.h` declares **read-only input contracts**;
-`diagnostics/types.h` exposes event and trace snapshots independently of Xlib.
-Settings/desktop page renderers no longer access application-global settings,
-GPU selection or NVMe state. UI mutations, GPU tuning writes and watchdog
-scheduling remain in the controller and `gpu/` modules. All control operations
-remain in the original single-threaded event loop.
-Splitting the modules does **not** guarantee 5 ms watchdog deadlines during
-blocking AI/network or Linux telemetry reads. Tuning remains disarmed by default;
-if the driver rejects a requested manual mode, the ARM state is cleared. Partial
-multi-write driver changes are not atomic and need real-hardware testing.
-
-The UI, 840 × 660 default window, settings schema and public `v0.7.0b` GitHub
-release remain unchanged. The `make check-control-module` target tests
-error paths using temporary file descriptors, not a live GPU. For architecture
-and remaining work, see [GPU write-boundary notes](docs/V080_STEP5_GPU_CONTROLS.md)
-and the [refactor roadmap](docs/V080_REFACTOR.md). A new `make check-ui-layout-module` target validates hitboxes and scrolling without a running X server; see [dev.6 UI architecture](docs/V080_STEP6_UI.md) and [dev.8 page modules](docs/V080_STEP8_PAGES.md).
-
-## Build and run (Arch Linux / X11)
-
-Install a C compiler, `make`, X11 headers, libcurl development headers and X11 runtime. To build:
+Needs a C compiler, `make`, X11 development libraries, libcurl and pthreads. Headless UI checks need `xvfb-run` and `xauth`.
 
 ```sh
-make
-make check check-config check-parser check-pcie check-audit check-maya-nvme check-modules check-settings-module check-ai-module check-cpu-module check-sources-module check-session-module check-readback-module check-control-module check-ui-layout-module check-ui-input-module check-dashboard-module check-pages-module check-events-module check-poll-timing-module check-ui
-sudo make install
-sudo -E /usr/local/bin/amd-gpu-diagnostic
+git clone https://github.com/kevito666/amd-gpu-diag-tool.git
+cd amd-gpu-diag-tool
+git switch refactor/v0.8.0
+make -j"$(nproc)"
+make check check-ui
+./amd-gpu-diagnostic --version
 ```
 
-The visual smoke tests need `xvfb-run` and `xauth`. Running the program without root is not supported for GPU power-policy tuning. `--version` and `--help` work without root. `--card N` chooses a DRM card on startup and overrides the saved preference for that invocation.
+The GitHub Actions workflow runs the larger regression suite, including the parser, settings, GPU readback/control, worker lifecycle, UI hitboxes and virtual-X11 pages. To run that same matrix locally, copy the `make` targets from [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
-## Screens and actions
+The existing GPU-control functionality needs appropriate privileges. Read the code before running it as root, and don't assume the write controls are safe on every AMDGPU driver. The `--version` and `--help` options don't need root. `--card N` selects a DRM card for that invocation.
 
-- **AI / GAMING** workflow buttons select the main dashboard.
-- **Header** uses a larger GPU model label and a consistent `Target = … | Actual = … | LOCKED/PAUSED | Corrections = …` status line.
-- **Settings** contains AI token/API/Project Maya log source, AI log parser, Auto/Manual log detection with an editable absolute filename, a saved AI NVMe device selector, compositor source, detected AMD card selector and an inert overclock unlock placeholder.
-- **Power** contains power, voltage, current, power caps, equivalent load estimates, power profile and policy. GPU thermals, clocks and VRR are under Gaming/Desktop.
-- **Tuning** has compact 3×2 tiles, firmware-range labels, and a 2×2 ARM/APPLY/RESET/REFRESH group inside the safety tile. RESET STOCK is available; do not confuse colored zones with safety certification.
-- **Desktop** reports session, X server, desktop, window manager, compositor, their installed Arch package versions and package build dates where known, plus DRM modes/refresh/VRR and explicitly unverified VSync/buffering.
-- **Events** shows the 15 most recent significant events it still retains, leaving high-frequency GFXOFF/DPM changes out of that *view*. CSV events are unaffected.
-- The square **?** opens keyboard and mouse help. **About** contains origin, license and development credits.
-
-### Settings and privilege boundary
-
-Settings persist in `~/.config/amd-gpu-diagnostic/settings.ini` in the **invoking user's** home directory (when started through sudo). Changes are saved atomically by dropping privileges before writing a mode-0600 file. The settings file is local, plain-text, and can be copied between systems; it is not a tuning profile. Editing the log filename accepts a typed absolute path; Enter saves; Esc cancels.
-
-Settings changes do not require a restart. After choosing another AMD card, click **APPLY GPU**. The app opens the new device first, then pauses policy enforcement, clears clock locks and tuning ARM state, and rebinds telemetry. It **does not restore the old GPU's pre-existing policy**. It will not automatically enable the watchdog on the newly selected GPU. Do not switch during an active dangerous tuning session.
-
-### Project Maya + AI NVMe monitoring (pre-beta addition)
-
-The AI dashboard includes a compact **AI NVMe CACHE I/O** tile showing read and write
-rates (MiB/s), observed peaks, and approximate device busy percentage from Linux
-`/sys/block/nvmeXnY/stat`. Settings > **AI NVME CACHE SSD** cycles detected NVMe
-namespaces and shows the kernel's model label. The chosen namespace (e.g. `nvme0n1`)
-is saved in the invoking user's `settings.ini` as `ai_nvme_device`. An invalid or missing
-device is shown as unavailable, never silently substituted for a different saved device.
-
-**The readings count all I/O on that NVMe namespace, not exclusively Project Maya/DeepSeek
-model traffic.** Sampling is approximately every 0.5 seconds, using monotonic elapsed time;
-peaks reset upon changing drives or a counter reset. This is a monitoring-only feature;
-there is no SSD writes, tuning, stress test, or hardware setting change.
-
-Project Maya produces `maya-<model>.log` beside its model configuration. Select **Project
-Maya (log)** for both AI DATA SOURCE and AI LOG PARSER, then choose the log path manually,
-or leave discovery set to Auto for supported locations: `~/src/project-maya`,
-`~/project-maya`, or `~/Downloads/project-maya`. Project Maya's verified GLM engine
-log entries include `glm stat:`, `glm prefill:`, `glm fast:` and `glm split`.
-The parser also retains `ds4`-prefixed engine lines without pretending a different
-format is compatible. The dashboard shows last reported decode rate, prefill rate
-when explicitly available, VRAM expert hit %, RAM fetches per token and SSD reads/
-wait time per token when logged. Values are completed log summaries, **not live
-per-token measurements**. Missing metrics are labeled unavailable, not inferred.
-
-If Project Maya uses an unusual custom location or log naming, use the **manual absolute
-log path** setting. For troubleshooting, the engine log is typically named
-`maya-<model>.log` in the Project Maya root. Project Maya supports model
-expert tiers spanning GPU VRAM, system RAM and NVMe; the filesystem I/O monitor is
-independent of its log parser. Upstream reference:
-[Project Maya](https://github.com/mw00/project-maya).
-
-### AI parser notes
-
-The llama.cpp/Bionic task-aware parser is fully implemented, including prompt/eval rates and host-RAM prompt cache messages from a 512 KiB log tail. Other log parser modes are **experimental placeholders**: users can select them, but task timing is not synthesized from unrelated log formats. Ollama/vLLM/LM Studio API token-source detection remains separate from log-file parsing. Prompt cache occupancy is an event-based *last-reported* value, not a sampled RSS reading. The 24 GiB Bionic host cache is separate from GPU VRAM.
-
-### Desktop diagnostics notes
-
-Version and **package build dates** come from local `/var/lib/pacman/local/*/desc` metadata, not a binary compile timestamp. On unsupported distributions the dates may show *unknown*. Display refresh is read from reported DRM CRTC state when debugfs access permits. DRM `vrr_enabled` describes the current kernel-reported state if exposed; it does not verify per-game frame pacing. **VSync/number of buffers cannot be reliably inferred from the compositor process, so they are marked unverified.**
-
-### Known issues / before tagging the beta
-
-- Validate on your RX 7900 XTX with picom/XFCE/XLibre, including the Settings screen's GPU selection and custom Bionic log path.
-- Validate a second AMD GPU, if possible, and test the pause/re-arm behavior during switching.
-- The code has been built under strict `-Werror` and tested against synthetic X11 telemetry; this does not guarantee safe hardware write behavior across drivers.
-- The overclock unlock feature does nothing in this beta by design.
-
-
-## v0.7.0b stabilization audit
-
-Before the GitHub beta tag, this source package received a correctness and performance pass. The main fixes are: CPU fan file-descriptor/path handling, libcurl authentication lifetime and bounded response buffering, cached `/proc`-based llama-server discovery, strict integer settings parsing, real interval CPU-process activity, and removal of stale/unverified AI rate and debug output. See [`docs/AUDIT_AND_ARCHITECTURE.md`](docs/AUDIT_AND_ARCHITECTURE.md) for tests, architecture and remaining limitations. The current window/tile organization and tuning safeguards are unchanged.
-
-This tarball has a **flat project-root layout** for updating your existing checkout directly. Your previous builds remain in `archive/`, which is excluded from Git. The screenshots above are genuine v0.7.0b captures; they show actual device readings, not synthetic performance claims.
-
-## License
-
-Copyright (C) 2026 Kevin Kolasa. Source and redistribution under **GPL-3.0-or-later**. Full text in `LICENSE`.
-
-### Second-pass pre-release audit
-
-The v0.7.0b source includes a second-pass stability audit, regression tests, and hardware testing checklist in [`docs/DEEP_AUDIT_2.md`](docs/DEEP_AUDIT_2.md). In particular, watchdog enforcement and synchronous telemetry share one event loop: configured microsecond intervals are desired sampling intervals, **not hard real-time guarantees**.
-
-For GitHub release assets, the source package contains a flat root layout; extract into an existing checkout only after backing up local changes. The X11 UI test harness compiles without optimization to keep headless CI responsive; the production binary uses the standard optimized build flags.
-
-## Polling profiler (opt-in, dev.9)
-
-`AMD_GPU_DIAG_TIMING=1` enables monotonic wall-clock timing for the four
-expensive non-watchdog collectors. The summary prints to stderr after a normal
-GUI exit (no periodic logging or disk writes). For example, from a terminal:
+### Watchdog timing under actual load
 
 ```sh
-AMD_GPU_DIAG_TIMING=1 ./amd-gpu-diagnostic
+# Capture each run separately; close the app normally.
+scripts/capture-watchdog-profile.sh idle
+scripts/capture-watchdog-profile.sh ai-load
+
+# Then compare the resulting log files.
+scripts/compare-watchdog-logs.sh idle.log ai-load.log
 ```
 
-Preserve the environment variable if the existing GPU-write setup requires
-privileged launch (e.g. `sudo -E`). These numbers are elapsed poll costs, not
-proof of causality for watchdog deadline misses. As of **0.8.0-dev.11**, the CPU/process/NVMe and AI HTTP/log samplers run on one
-background *read-only* worker with copied inputs and snapshots. The foreground
-thread retains exclusive GPU-control authority and Xlib. The timing summary's
-System+AI duration is background wall time, **not foreground blocking time**.
-Client scans, DRM/session probes, tracefs and screen draws still run in the
-foreground, so configured microsecond intervals remain best-effort rather than
-hard deadlines. If worker startup fails, the app prints a warning and falls back
-to synchronous sampling (no isolation). See
-[`docs/DEV11_MONITOR_WORKER.md`](docs/DEV11_MONITOR_WORKER.md) for synchronization,
-shutdown and testing details.
+The capture scripts do **not** start inference or modify tuning settings themselves. The numbers need to be taken on real hardware before making performance claims. Details: [beta-readiness testing](docs/V080_STEP15_BETA_READINESS.md).
 
+## Where the source went
 
-## v0.8.0-dev.11–dev.13 monitoring workers (development checkpoints)
+| Directory | What lives there |
+|---|---|
+| `src/gpu/` | Device handling, readback, policy, guarded tuning and firmware writes |
+| `src/monitor/` | CPU/sensors, GPU client scans, NVMe, desktop discovery, background workers |
+| `src/ai/` | llama.cpp/Bionic and Project Maya parsing, logs and HTTP sampling |
+| `src/ui/` | Xlib drawing, layouts, page renderers, mouse/keyboard handling |
+| `src/diagnostics/` | Events and tracefs |
+| `src/app/` | Watchdog/poll timing diagnostics |
+| `src/config/` | Persistent Settings |
+| `tests/`, `docs/`, `scripts/` | Regression checks, engineering notes, development tools |
 
-The read-only monitoring worker samples system CPU, processes, NVMe and AI
-HTTP/log data without holding up each 5 ms GPU policy iteration. Only completed
-snapshots are consumed by the GUI. The GPU policy/tuning writers remain on the
-main thread; no new control privileges or overclocking are enabled. The monitor
-is designed to coalesce bursts of requests instead of queueing unlimited work.
-Run `make check-monitor-worker-module` for the isolated concurrency tests.
+For the step-by-step refactor notes, see [the v0.8.0 roadmap](docs/V080_REFACTOR.md), [worker hardening](docs/V080_STEP14_HARDENING.md) and [beta readiness](docs/V080_STEP15_BETA_READINESS.md). The long technical history belongs there rather than on the front page.
 
-In **dev.12**, expensive DRM client enumeration (`/proc/*/fdinfo`),
-compositor process discovery, DRM/KMS state, and Arch package version/build-date
-reads run in a second independent read-only thread. A 1-second request cadence
-coalesces stale pending requests; desktop/package sampling runs at ~10-second
-intervals. The foreground only consumes complete copied results, performs
-X11-specific enrichment, and rejects snapshots from old card selections or
-compositor-source settings. No GPU descriptor or control-writer is shared
-with the discovery worker. See [dev.12 discovery design](docs/V080_STEP12_DISCOVERY.md).
+## Still on the list
 
-**Dev.13:** The AI monitor and discovery workers now carry generation IDs to
-reject results from earlier A → B → A selections. The previous synchronous
-`lms ps` subprocess was removed because it did not supply real token-rate data
-and could block shutdown. Use `AMD_GPU_DIAG_TIMING=1` during matched idle and
-AI-load sessions, then compare log files with
-`scripts/compare-watchdog-logs.sh idle.log inference.log`. Quantiles are
-approximate histogram ceilings of *late* cycles, not hard-real-time guarantees.
-See [dev.13 stability notes](docs/V080_STEP13_STABILITY.md).
+- **Scrollbar dragging:** mouse-wheel scrolling works; click-and-drag scrollbar thumbs are not implemented yet.
+- **Hardware validation:** watchdog latency during sustained inference, multi-GPU switching, and tuning/rollback behavior need real-card testing.
+- **Real-time guarantees:** the nominal 5 ms watchdog interval is best-effort, not a deterministic deadline. GPU readback, X11 and tracefs can still cause delays.
+- **Settings/overclocking:** settings schema remains compatible with v0.7.0b. The overclock-unlock control remains an inert placeholder. Partially applied firmware writes are not atomic.
 
-`make check-discovery-worker-module check-worker-lifecycle check-clients-module` exercises concurrency,
-provenance, and DRM fdinfo parsing without hardware. Worker durations are
-reported by `AMD_GPU_DIAG_TIMING=1`, but those durations represent **worker
-wall time**, not blocking time on the watchdog thread. The remaining foreground
-operations (GPU power/DPM, tracefs, X11 rendering and event handling) can still
-miss scheduling deadlines. No hard-real-time claim is made.
+Found a bug? [Open an issue](https://github.com/kevito666/amd-gpu-diag-tool/issues) with your card, kernel, driver, desktop environment, steps and relevant logs. Please strip credentials and personal paths before posting logs.
 
-The app still requires physical GPU and workload testing before v0.8.0b.
-
-### dev.14 worker and log-file hardening
-
-A source generation change resets **worker-private** AI counters and prompt-cache
-history, not just the GUI copy. Manually selected log paths are accepted only
-when they resolve to regular files; FIFOs/devices/directories are rejected
-without a blocking open. A new `make check-worker-lifecycle` fixture verifies
-orderly stop, pending-sample cancellation and restart for both read-only workers.
-These changes do not promise hard-real-time GPU enforcement or immediate
-thread cancellation; active read-only callbacks still finish before shutdown.
-See [dev.14 hardening notes](docs/V080_STEP14_HARDENING.md).
-
-### dev.15 — beta-readiness diagnostics
-
-The optional watchdog profiler now measures **start-to-start intervals between
-actual watchdog checks** alongside its deadline-miss and lateness statistics.
-It reports the maximum observed gap, average gap, counts exceeding 10/50/500 ms,
-gaps more than twice the preceding configured interval, and misses/minute.
-Unlike the previous positive-lateness-only percentiles, these intervals include
-cycles that met their scheduled deadlines. They do not prove hard-real-time safety.
-
-Monitoring snapshots no longer copy live worker-owned Linux sensor file-descriptor
-numbers into the foreground; the worker retains responsibility for closing the
-real handles. The UI still receives sampled temperatures, power and labels.
-Use `scripts/capture-watchdog-profile.sh idle` followed by
-`scripts/capture-watchdog-profile.sh ai-load`, close each normally, then compare
-reports with `scripts/compare-watchdog-logs.sh`. These scripts are opt-in and do
-not start inference or tune the GPU themselves. See
-[dev.15 hardware-validation procedure](docs/V080_STEP15_BETA_READINESS.md).
-
-
-
-### v0.8.0-dev.16 UI refinements
-
-Tuning includes **Browse AMD Reference Database**, a read-only scrolling catalog of the built-in Radeon reference specifications (game/boost clocks, typical board power, VRAM and architecture). These are not tuning limits; the firmware controls still take precedence. Settings displays its controls in two columns, with actions below their labels. The About tab is distinct from the `?` Help button.
+Built by **Kevin Kolasa** ([@kevito666](https://github.com/kevito666)) in Tohoku, Japan. **GPL-3.0-or-later**; see [LICENSE](LICENSE).

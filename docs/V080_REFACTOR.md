@@ -4,7 +4,7 @@
 
 - Published baseline: tag `v0.7.0b`, commit `595f6d6`.
 - Development branch: `refactor/v0.8.0`.
-- Current checkpoint: `0.8.0-dev.15` (**not** a public beta).
+- Current checkpoint: `0.8.0-dev.16` (**not** a public beta).
 - No Git push, tag, or system-wide install is required for this checkpoint.
 - Core invariants: same settings format, same tuning safeguards and single
   writer to AMDGPU firmware/sysfs paths, same Xlib UI behavior, same telemetry
