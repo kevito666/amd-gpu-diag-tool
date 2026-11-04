@@ -1,8 +1,10 @@
+# Local build products (object/dependency files are emitted inside src/).
 /amd-gpu-diagnostic
-/.check-*
-/tests/v070b/
 *.o
-*.swp
+*.d
+/.check-*
 
+# Local development history and diagnostics must never enter Git releases.
 /archive/
 /debug.log
+/tests/v070b/

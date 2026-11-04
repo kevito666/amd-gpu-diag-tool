@@ -1,3 +1,4 @@
+<!-- Historical v0.7.0b GitHub release notes. v0.8.0-dev.16 is an unpublished refactor checkpoint. -->
 # GitHub beta: v0.7.0b
 
 **Tag:** `v0.7.0b`\

@@ -1,9 +1,12 @@
 /* Hardware-free tests for negotiated PCIe link and active BAR aperture.
  * Never touches the host's real PCIe sysfs or GPU controls. */
-int diagnostic_program_main(int argc, char **argv);
-#define main diagnostic_program_main
-#include "../src/amd-gpu-diagnostic.c"
-#undef main
+#define _GNU_SOURCE
+#include "../src/gpu/readback.h"
+#include "../src/core/util.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
 
 #include <assert.h>
 
@@ -30,20 +33,20 @@ int main(void) {
     PowerTelemetry power={0};
     text_copy(sys.gpu_base,sizeof(sys.gpu_base),dir);
     power.gpu_busy=75;
-    sample_pcie_link(&sys,&power);
+    gpu_sample_pcie_link(&sys,&power);
     assert(power.pcie_link_valid);
     assert(power.pcie_current_width==8 && power.pcie_max_width==16);
     assert(power.bar0_valid && power.bar0_bytes == 32ULL*1073741824ULL);
     assert(power.rebar_supported);
-    assert(pcie_downshift_under_load(&power)==1);
+    assert(gpu_pcie_downshift_under_load(&power)==1);
     power.gpu_busy=10; /* idle downshift should not be flagged as bottleneck */
-    assert(pcie_downshift_under_load(&power)==0);
+    assert(gpu_pcie_downshift_under_load(&power)==0);
 
     write_fixture(dir,"current_link_speed","16.0 GT/s PCIe\n");
     write_fixture(dir,"current_link_width","16\n");
     power.gpu_busy=75;
-    sample_pcie_link(&sys,&power);
-    assert(pcie_downshift_under_load(&power)==0);
+    gpu_sample_pcie_link(&sys,&power);
+    assert(gpu_pcie_downshift_under_load(&power)==0);
 
     char path[MAX_PATH_LEN];
     const char *leaves[]={"current_link_speed","max_link_speed","current_link_width",
@@ -52,9 +55,9 @@ int main(void) {
         assert(path_join(path,sizeof(path),dir,leaves[i]));
         assert(unlink(path)==0);
     }
-    sample_pcie_link(&sys,&power);
+    gpu_sample_pcie_link(&sys,&power);
     assert(!power.pcie_link_valid && !power.bar0_valid && !power.rebar_supported);
-    assert(pcie_downshift_under_load(&power)==-1);
+    assert(gpu_pcie_downshift_under_load(&power)==-1);
     assert(rmdir(dir)==0);
     puts("PCIe/BAR monitor PASS: actual aperture, width/speed, idle downshift, and unknown-state reset");
     return 0;

@@ -108,6 +108,7 @@ int main(int argc, char **argv) {
     snprintf(clients.items[0].name,sizeof(clients.items[0].name),"llama-server");
     clients.items[0].activity_pct=62.8;
     trace.available=true;
+    tuning.spec = gpu_spec_match(gpu.full_name, gpu.vram_bytes);
     tuning.armed=false;
     tuning.has_sclk=true;tuning.edit_sclk_max_mhz=2650;
     tuning.has_mclk=true;tuning.edit_mclk_max_mhz=2500;
@@ -150,20 +151,62 @@ int main(int argc, char **argv) {
     View view=VIEW_DASHBOARD;
     if(argc>1) {if(strcmp(argv[1],"gaming")==0)g_workflow=WORKFLOW_GAMING;
                  else if(strcmp(argv[1],"tuning")==0)view=VIEW_TUNING;
+                 else if(strcmp(argv[1],"tuning-disabled")==0) {
+                     view=VIEW_TUNING;
+                     tuning.has_sclk=false;
+                     tuning.has_mclk=false;
+                     tuning.has_vdd_offset=false;
+                 }
                  else if(strcmp(argv[1],"power")==0)view=VIEW_POWER;
                  else if(strcmp(argv[1],"help")==0)view=VIEW_HELP;
                  else if(strcmp(argv[1],"about")==0)view=VIEW_ABOUT;
                  else if(strcmp(argv[1],"events")==0)view=VIEW_EVENTS;
                  else if(strcmp(argv[1],"settings")==0)view=VIEW_SETTINGS;
+                 else if(strcmp(argv[1],"reference")==0)view=VIEW_GPU_DATABASE;
                  else if(strcmp(argv[1],"desktop")==0)view=VIEW_DESKTOP;
                  else if(strcmp(argv[1],"clients")==0)view=VIEW_CLIENTS;}
-    Gui ui; if(gui_init(&ui,&session)) return 1;
-    if(argc>2) gui_scroll(&ui,view,atoi(argv[2]));
+    Gui ui; if(ui_window_open(&ui,&session,VERSION,g_settings.compositor_source)) return 1;
+    if (argc > 1 && strcmp(argv[1], "navigation") == 0) {
+        char msg[256] = {0};
+        int interval_us=5000, dpm_interval_us=250000;
+        bool monitor_clocks=false, adaptive=true;
+        long long burst_until_ns=0;
+        Rect about_tab=tab_rect(&ui,8);
+        handle_click(&ui, about_tab.x+about_tab.w/2,about_tab.y+about_tab.h/2,
+                     &sysfs,&target,&tuning,&interval_us,&dpm_interval_us,
+                     &monitor_clocks,&adaptive,&burst_until_ns,
+                     &trace,&events,&view,msg,sizeof(msg));
+        if (view != VIEW_ABOUT) { fprintf(stderr,"About tab navigation failure\n");ui_window_close(&ui);return 2; }
+        Rect help=help_rect(&ui);
+        handle_click(&ui,help.x+help.w/2,help.y+help.h/2,
+                     &sysfs,&target,&tuning,&interval_us,&dpm_interval_us,
+                     &monitor_clocks,&adaptive,&burst_until_ns,
+                     &trace,&events,&view,msg,sizeof(msg));
+        if (view != VIEW_HELP) { fprintf(stderr,"Help button navigation failure\n");ui_window_close(&ui);return 3; }
+        view = VIEW_TUNING;
+        ui.scroll_y = 0;
+        Rect browse=gpu_db_button_rect(&ui);
+        handle_click(&ui,browse.x+browse.w/2,
+                     browse.y+browse.h/2 + UI_CONTENT_TOP-UI_PAGE_Y,
+                     &sysfs,&target,&tuning,&interval_us,&dpm_interval_us,
+                     &monitor_clocks,&adaptive,&burst_until_ns,
+                     &trace,&events,&view,msg,sizeof(msg));
+        if (view != VIEW_GPU_DATABASE) { fprintf(stderr,"GPU browse button failure\n");ui_window_close(&ui);return 4; }
+        Rect back=gpu_db_back_rect(&ui);
+        handle_click(&ui,back.x+back.w/2,
+                     back.y+back.h/2 + UI_CONTENT_TOP-UI_PAGE_Y,
+                     &sysfs,&target,&tuning,&interval_us,&dpm_interval_us,
+                     &monitor_clocks,&adaptive,&burst_until_ns,
+                     &trace,&events,&view,msg,sizeof(msg));
+        if (view != VIEW_TUNING) { fprintf(stderr,"GPU database back button failure\n");ui_window_close(&ui);return 5; }
+        puts("Navigation click tests: PASS");
+    }
+    if(argc>2) gui_scroll(&ui,view,g_workflow,atoi(argv[2]));
     gui_draw(&ui,&gpu,&sysfs,&target,&stats,5000,250000,false,true,&clients,
              &power,&system,&session,&events,&trace,&tuning,view,"");
     XSync(ui.dpy,False);
     if (getenv("GPU_PREVIEW_PAUSE")) sleep(3);
     else usleep(150000);
-    gui_close(&ui);
+    ui_window_close(&ui);
     return 0;
 }

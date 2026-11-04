@@ -104,6 +104,30 @@ int main(void) {
     assert(telemetry.tokens.tokens_per_sec == 0);
     assert(telemetry.tokens.last_api_poll.tv_sec == 0);
 
+    /* A->B->A source changes must reset worker-private history even when the
+     * eventual selected source matches the first request. CPU sensor state
+     * must survive because its file descriptors belong to this worker. */
+    NvmeMonitor nvme={0};
+    BackgroundMonitor bg;
+    background_monitor_init(&bg, &nvme);
+    background_monitor_reset_generation(&bg, 12);
+    bg.system.tokens.prev_decoded = 999;
+    bg.system.tokens.has_data = true;
+    bg.system.ai_prompt_cache.usage_valid = true;
+    bg.system.ai_prompt_cache.used_mib = 2048;
+    bg.system.ai_log_event_count = 3;
+    bg.events[0].task_id = 77;
+    bg.system.have_cpu_sample = true;
+    bg.system.prev_cpu_total = 123456;
+    background_monitor_reset_generation(&bg, 12);
+    assert(bg.system.tokens.prev_decoded == 999); /* unchanged generation */
+    background_monitor_reset_generation(&bg, 13);
+    assert(!bg.system.tokens.has_data && bg.system.tokens.prev_decoded == 0);
+    assert(!bg.system.ai_prompt_cache.usage_valid && bg.system.ai_log_event_count == 0);
+    assert(bg.events[0].task_id == 0 && bg.parser.last_parser == LOG_COUNT);
+    assert(bg.system.have_cpu_sample && bg.system.prev_cpu_total == 123456);
+    background_monitor_close(&bg);
+
     /* Turning off log parsing removes the cached history and cache occupancy. */
     g_settings.log_parser = LOG_OFF;
     telemetry.ai_prompt_cache.usage_valid = true;
@@ -111,7 +135,9 @@ int main(void) {
     telemetry.ai_log_event_count = 4;
     text_copy(telemetry.ai_log_path, sizeof(telemetry.ai_log_path), "/tmp/old-bionic.log");
     g_ai_log_events[0].task_id = 123;
-    parse_ai_log(&telemetry);
+    AiLogParseContext parser_ctx={.last_parser=LOG_COUNT};
+    MayaLogMonitor maya={0};
+    parse_ai_log(&telemetry, &g_settings, &maya, g_ai_log_events, &parser_ctx);
     assert(!telemetry.ai_prompt_cache.usage_valid);
     assert(telemetry.ai_log_event_count == 0 && telemetry.ai_log_path[0] == '\0');
     assert(g_ai_log_events[0].task_id == 0);
