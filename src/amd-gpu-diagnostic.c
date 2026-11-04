@@ -2096,10 +2096,11 @@ static int detect_amd_gpus(Gpu *out, int max) {
         else
             snprintf(g->device_id, sizeof(g->device_id), "unknown");
 
-        char real[MAX_PATH_LEN];
-        if (realpath(dev, real)) {
-            const char *last = strrchr(real, '/');
-            text_copy(g->pci_addr, sizeof(g->pci_addr), last ? last + 1 : real);
+        char *resolved = realpath(dev, NULL);
+        if (resolved) {
+            const char *last = strrchr(resolved, '/');
+            text_copy(g->pci_addr, sizeof(g->pci_addr), last ? last + 1 : resolved);
+            free(resolved);
         } else {
             snprintf(g->pci_addr, sizeof(g->pci_addr), "unknown");
         }
